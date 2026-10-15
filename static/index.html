@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude 会话台 · Session Bridge</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23171410'/%3E%3Ctext x='32' y='44' font-size='38' text-anchor='middle' fill='%23c9a269' font-family='serif'%3E%E9%89%B4%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/vendor/xterm.min.css">
+<link rel="stylesheet" href="/static/styles.css?v=20261015m2">
+</head>
+<body>
+
+<div id="gate" class="gate hidden">
+  <form id="gate-form" class="gate-card">
+    <div class="gate-mark">鉴</div>
+    <h1>Claude 会话台</h1>
+    <p>本机访问令牌（启动窗口 / data/token.txt）</p>
+    <input id="gate-token" type="password" autocomplete="off" placeholder="粘贴 token">
+    <button type="submit">进入</button>
+    <div id="gate-err" class="gate-err"></div>
+  </form>
+</div>
+
+<div id="app" class="app hidden">
+  <aside class="rail">
+    <div class="brand">
+      <div class="brand-seal">鉴</div>
+      <div class="brand-text">
+        <div class="brand-title">会话台</div>
+        <div class="brand-sub">CLAUDE · SESSION BRIDGE</div>
+      </div>
+    </div>
+
+    <div class="rail-actions">
+      <button id="btn-new" class="btn-gold">＋ 托管新会话</button>
+      <button id="btn-refresh" class="btn-ghost" title="立即刷新">↻</button>
+    </div>
+
+    <div class="rail-section">
+      <div class="rail-h"><span class="dot dot-live"></span>托管会话 <em id="count-managed">0</em></div>
+      <div id="list-managed" class="session-list"></div>
+    </div>
+    <div class="rail-section grow">
+      <div class="rail-h"><span class="dot dot-ext"></span>本机会话 <em id="count-external">0</em></div>
+      <div id="list-external" class="session-list"></div>
+    </div>
+
+    <div class="rail-foot">
+      <div id="net-info" class="net-info" title="手机同网段访问"></div>
+    </div>
+  </aside>
+
+  <main class="stage">
+    <div id="empty-state" class="empty-state">
+      <div class="empty-glyph">⛽</div>
+      <h2>选一个会话接入</h2>
+      <p>左侧「本机会话」是 cmd / 终端里已在跑的 Claude，可远程打字；<br>
+         「托管新会话」在网页里得到完整终端，断开也继续跑。</p>
+    </div>
+
+    <!-- 外部会话视图 -->
+    <section id="view-external" class="view hidden">
+      <header class="view-head">
+        <button class="vh-back" data-back title="返回会话列表">‹</button>
+        <div class="vh-main">
+          <span class="vh-tag">远程输入</span>
+          <span id="ext-title" class="vh-title"></span>
+        </div>
+        <div class="vh-side">
+          <span id="probe-badge" class="badge badge-unknown">未探测</span>
+          <button id="btn-probe" class="btn-ghost btn-sm">探测控制台</button>
+          <select id="transcript-select" class="mini-select" title="切换会话记录"></select>
+        </div>
+      </header>
+      <div class="vh-meta"><span id="ext-meta"></span></div>
+
+      <div id="transcript" class="transcript">
+        <div class="tr-hint">会话记录镜像（读取本地 ~/.claude/projects，发送后自动刷新）</div>
+      </div>
+
+      <div class="composer">
+        <textarea id="input-text" rows="2"
+          placeholder="输入消息，Enter 发送（同 cmd），Shift+Enter 多行"></textarea>
+        <div class="composer-note">注：向「已有终端」直接打字，英文/数字可靠；中文若出现叠字请改用左上「托管新会话」（完整终端、中文正常）。</div>
+        <div class="composer-bar">
+          <div class="composer-keys">
+            <button class="key-btn" data-key="escape" title="中断生成（同 Esc）">Esc</button>
+            <button class="key-btn" data-key="ctrl_c" title="Ctrl+C">Ctrl+C</button>
+          </div>
+          <button id="btn-send" class="btn-gold">发送 ↵</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 托管会话视图 -->
+    <section id="view-managed" class="view hidden">
+      <header class="view-head">
+        <button class="vh-back" data-back title="返回会话列表">‹</button>
+        <div class="vh-main">
+          <span class="vh-tag vh-tag-managed">托管终端</span>
+          <span id="mgr-title" class="vh-title"></span>
+        </div>
+        <div class="vh-side">
+          <span id="ws-badge" class="badge badge-unknown">连接中…</span>
+          <button id="btn-mgr-stop" class="btn-ghost btn-sm danger">结束会话</button>
+        </div>
+      </header>
+      <div id="terminal" class="terminal-host"></div>
+
+      <!-- 手机端输入条（桌面端由 CSS 隐藏，桌面直接敲终端） -->
+      <div id="mcomposer" class="mcomposer">
+        <textarea id="mgr-input" rows="2" enterkeyhint="send"
+          placeholder="输入消息，Enter 发送，Shift+Enter 多行"></textarea>
+        <div class="composer-bar">
+          <div class="composer-keys">
+            <button class="key-btn" data-mkey="escape" title="中断生成（同 Esc）">Esc</button>
+            <button class="key-btn" data-mkey="ctrl_c" title="Ctrl+C">Ctrl+C</button>
+          </div>
+          <button id="btn-mgr-send" class="btn-gold">发送 ↵</button>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 新建托管会话 -->
+<div id="modal-new" class="modal hidden">
+  <div class="modal-card">
+    <h3>新建托管会话</h3>
+    <p class="modal-sub">Claude 将在该目录下启动，网页即完整终端；关掉网页不影响它继续跑。</p>
+    <input id="new-cwd" list="dir-list" placeholder="E:\1workspace" autocomplete="off">
+    <datalist id="dir-list"></datalist>
+    <div id="dir-quick" class="dir-quick"></div>
+    <div class="modal-bar">
+      <button id="new-cancel" class="btn-ghost">取消</button>
+      <button id="new-ok" class="btn-gold">启动</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/vendor/xterm.min.js"></script>
+<script src="/static/vendor/addon-fit.min.js"></script>
+<script src="/static/app.js?v=20261015m2"></script>
+</body>
+</html>
