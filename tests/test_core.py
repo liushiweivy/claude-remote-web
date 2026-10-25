@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from server import anchors, injector, ptyman, sessions, transcripts
 from server import app as appmod
 from server.app import TOKEN, app
+from server.replay import ReplayBuffer
 
 
 # ---------- sessions ----------
@@ -309,6 +310,7 @@ def test_single_input_failure_registers_no_anchor(monkeypatch, _clear_anchors):
 def test_ws_managed_input_registers_anchor(monkeypatch, _clear_anchors):
     class _Sess:
         cwd = r"E:\c"
+        replay = ReplayBuffer()
 
         def alive(self):
             return True
@@ -344,6 +346,7 @@ def test_ws_managed_ping_pong(monkeypatch):
 
     class _Sess:
         cwd = r"E:\c"
+        replay = ReplayBuffer()
 
         def alive(self):
             return True
@@ -368,3 +371,83 @@ def test_ws_managed_ping_pong(monkeypatch):
                 break
         assert got == appmod.WS_PONG
     assert written == []  # ping 绝不进 PTY 输入
+
+
+class _ReplaySess:
+    """预装回放缓冲的假托管会话，验证断连补差握手。"""
+    cwd = r"E:\c"
+
+    def __init__(self, preload=""):
+        self.replay = ReplayBuffer()
+        if preload:
+            self.replay.append(preload)
+
+    def alive(self):
+        return True
+
+    def write(self, data):
+        pass
+
+    def resize(self, cols, rows):
+        pass
+
+
+def _recv_until(ws, pred, deadline=5.0):
+    end = time.time() + deadline
+    while time.time() < end:
+        msg = ws.receive_json()
+        if pred(msg):
+            return msg
+    raise AssertionError("没等到目标帧")
+
+
+def test_ws_hello_then_resume_full_replay(monkeypatch):
+    """首连：hello 报区间 → resume(have=0) → 全量回放一帧带回。"""
+    monkeypatch.setattr("server.app.pty_manager.get",
+                        lambda sid: _ReplaySess("历史输出abc"))
+    with client.websocket_connect(f"/ws/managed/7?token={TOKEN}") as ws:
+        hello = ws.receive_json()
+        assert hello["type"] == "hello"
+        assert hello["total"] == len("历史输出abc") and hello["oldest"] == 0
+        ws.send_json({"type": "resume", "have": 0})
+        d = _recv_until(ws, lambda m: m.get("type") == "d")
+        assert d["o"] == 0 and d["s"] == "历史输出abc"
+
+
+def test_ws_resume_delta_only(monkeypatch):
+    """重连：报已收偏移，服务端只补差额。"""
+    monkeypatch.setattr("server.app.pty_manager.get",
+                        lambda sid: _ReplaySess("abcdef"))
+    with client.websocket_connect(f"/ws/managed/7?token={TOKEN}") as ws:
+        ws.receive_json()  # hello
+        ws.send_json({"type": "resume", "have": 3})
+        d = _recv_until(ws, lambda m: m.get("type") == "d")
+        assert d["o"] == 3 and d["s"] == "def"
+
+
+def test_ws_stale_offset_gets_reset_then_full(monkeypatch):
+    """客户端偏移超前（服务端重启过）：先 reset 再从 oldest 全量重发。"""
+    monkeypatch.setattr("server.app.pty_manager.get",
+                        lambda sid: _ReplaySess("xy"))
+    with client.websocket_connect(f"/ws/managed/7?token={TOKEN}") as ws:
+        ws.receive_json()  # hello
+        ws.send_json({"type": "resume", "have": 9999})
+        rst = _recv_until(ws, lambda m: m.get("type") == "reset")
+        assert rst == {"type": "reset"}
+        d = _recv_until(ws, lambda m: m.get("type") == "d")
+        assert d["o"] == 0 and d["s"] == "xy"
+
+
+def test_ws_live_output_streams_with_offsets(monkeypatch):
+    """握手后新输出以 d 帧流出，偏移连续。"""
+    sess = _ReplaySess("")
+    monkeypatch.setattr("server.app.pty_manager.get", lambda sid: sess)
+    with client.websocket_connect(f"/ws/managed/7?token={TOKEN}") as ws:
+        ws.receive_json()  # hello
+        ws.send_json({"type": "resume", "have": 0})
+        sess.replay.append("第一段")
+        d1 = _recv_until(ws, lambda m: m.get("type") == "d")
+        sess.replay.append("第二段")
+        d2 = _recv_until(ws, lambda m: m.get("type") == "d" and m["o"] > 0)
+        assert d1["s"] == "第一段" and d2["s"] == "第二段"
+        assert d2["o"] == d1["o"] + len(d1["s"])

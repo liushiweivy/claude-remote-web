@@ -6,9 +6,12 @@ import itertools
 import os
 import subprocess
 import threading
+import time
 from datetime import datetime
 
 import winpty
+
+from .replay import ReplayBuffer
 
 CMD = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "cmd.exe")
 DEFAULT_COLS, DEFAULT_ROWS = 120, 32
@@ -39,6 +42,30 @@ class ManagedSession:
         self.started = True
         self.started_at = datetime.now().astimezone()
         self._lock = threading.Lock()
+        # 回滚缓冲 + 常驻读取线程：没人连 WS 时 PTY 输出也持续落缓冲
+        # （旧实现只在 WS 连接期间读，断开期间输出淤积可能撑满 ConPTY 缓冲），
+        # 重连后客户端报偏移补差额（见 replay.py / app.py ws_managed）。
+        self.replay = ReplayBuffer()
+        self._reader = threading.Thread(
+            target=self._pump_replay, daemon=True, name=f"crw-pty-reader-{sid}")
+        self._reader.start()
+
+    def _pump_replay(self) -> None:
+        """把 PTY 输出搬进回滚缓冲，直到会话退出且读干。"""
+        while True:
+            chunk = self.read()
+            if chunk:
+                self.replay.append(chunk)
+                continue
+            if not self.alive():
+                # 进程退出后可能还有残留输出，读干再收尾
+                tail = self.read()
+                if tail:
+                    self.replay.append(tail)
+                    continue
+                self.replay.mark_eof()
+                return
+            time.sleep(0.03)
 
     @property
     def pid(self) -> int | None:

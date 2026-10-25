@@ -2,3 +2,4 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 pywinpty>=2.0
 pymysql>=1.1.0
+pywebpush>=2.0

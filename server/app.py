@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -19,7 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (anchors, broadcast, injector, outbox, promptlog, quota,
+from . import (anchors, broadcast, injector, outbox, promptlog, push, quota,
                session_registry, sessions, transcripts)
 from .ptyman import PtyManager
 
@@ -49,6 +50,33 @@ TOKEN = _load_token()
 
 # 托管 WS 应用层心跳应答帧（客户端按此精确串识别，与 PTY 输出区分）
 WS_PONG = '{"type":"pong"}'
+
+
+async def _dispatch_ctl(sess, sid: int, msg: dict, ws: WebSocket) -> None:
+    """托管 WS 客户端→服务端控制帧（resume 握手迟到帧也走这里）。"""
+    kind = msg.get("type")
+    if kind == "input":
+        data = msg.get("data", "")
+        written = sess.write(data)
+        # 锚点只登记"整句发送"：网页输入框（结尾回车）或 bracketed-paste；
+        # 逐键输入 / 裸控制键的落盘文本不可预测，登记反而是假证据
+        if data.endswith("\r") or "\x1b[200~" in data:
+            text = anchors.clean_payload(data)
+            if text.strip():
+                anchors.store.add(("mgr", sid), sess.cwd, text)
+                # 发送回执事实源（与外部注入/广播同等待遇）；
+                # write 失败进不了终端，不算已注入
+                if written:
+                    promptlog.log("single", f"mgr {sid}", text,
+                                  cwd=sess.cwd or "")
+    elif kind == "ping":
+        # 应用层心跳：浏览器 WS API 发不了协议层 ping，手机切后台/弱网后
+        # 连接半开（readyState 仍是 OPEN 但实际已死），客户端靠 pong
+        # 超时判死并主动重连。pong 与控制帧同为 JSON，客户端按 type 分流。
+        await ws.send_text(WS_PONG)
+    elif kind == "resize":
+        sess.resize(int(msg.get("cols", 0)), int(msg.get("rows", 0)))
+    # resume 迟到帧（首帧竞态）无害，忽略
 pty_manager = PtyManager()
 app = FastAPI(title="Claude Session Bridge", docs_url=None, redoc_url=None)
 
@@ -67,6 +95,14 @@ def require(token: str | None, x_auth_token: str | None,
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/sw.js")
+def service_worker():
+    # Service Worker 必须挂在根路径才能覆盖整站 scope（放 /static 下只能管 /static）
+    return FileResponse(STATIC_DIR / "sw.js",
+                        media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache"})
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -517,6 +553,54 @@ def delete_managed(sid: int, token: str | None = Query(None),
     return {"ok": True}
 
 
+# ---------- Web Push 完成通知 ----------
+
+class PushSubBody(BaseModel):
+    subscription: dict
+
+
+@app.get("/api/push/vapid")
+def push_vapid(token: str | None = Query(None),
+               x_auth_token: str | None = Header(None)):
+    require(token, x_auth_token)
+    try:
+        pub = push.vapid_public_key(push.load_or_create_vapid())
+    except Exception as e:  # noqa: BLE001 - 密钥损坏属配置故障
+        raise HTTPException(500, f"VAPID 不可用: {e}")
+    return {"publicKey": pub}
+
+
+@app.post("/api/push/subscribe")
+def push_subscribe(body: PushSubBody,
+                   token: str | None = Query(None),
+                   x_auth_token: str | None = Header(None)):
+    require(token, x_auth_token)
+    sub = body.subscription
+    if not isinstance(sub.get("endpoint"), str) or not isinstance(
+            sub.get("keys"), dict):
+        raise HTTPException(400, "订阅格式无效")
+    return {"ok": True, "count": push.save_sub(sub)}
+
+
+@app.post("/api/push/unsubscribe")
+def push_unsubscribe(body: PushSubBody,
+                     token: str | None = Query(None),
+                     x_auth_token: str | None = Header(None)):
+    require(token, x_auth_token)
+    endpoint = body.subscription.get("endpoint", "")
+    return {"ok": True, "count": push.remove_sub(endpoint)}
+
+
+@app.post("/api/push/test")
+def push_test(token: str | None = Query(None),
+              x_auth_token: str | None = Header(None)):
+    require(token, x_auth_token)
+    sent = push.send_push_all("🔔 会话台推送已开通",
+                              "会话跑完/等你批准时会通知到这里",
+                              tag="crw-test")
+    return {"ok": True, "sent": sent}
+
+
 @app.websocket("/ws/managed/{sid}")
 async def ws_managed(ws: WebSocket, sid: int, token: str | None = Query(None)):
     if not check_token(token, None, None):
@@ -528,40 +612,55 @@ async def ws_managed(ws: WebSocket, sid: int, token: str | None = Query(None)):
         return
     await ws.accept()
 
+    # 断连补差握手（借鉴 claudecodeui 的 seq+subscribe，偏移=字符数）：
+    # 服务端发 hello 报可用区间，客户端回 resume 报已收到偏移，服务端只补差额；
+    # 客户端偏移不可得（太旧/服务重启）则先发 reset 再全量重发。
+    async def send_json(obj: dict) -> None:
+        await ws.send_text(json.dumps(obj, ensure_ascii=False))
+
+    with sess.replay.cond:
+        hello = {"type": "hello", "total": sess.replay.total,
+                 "oldest": sess.replay.oldest}
+    await send_json(hello)
+
+    have = -1
+    try:
+        # 客户端 onopen 立即回 resume；5s 没等到按全新客户端全量重发
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
+        if msg.get("type") == "resume":
+            have = int(msg.get("have", -1))
+        else:
+            await _dispatch_ctl(sess, sid, msg, ws)
+    except TimeoutError:
+        pass
+
+    with sess.replay.cond:
+        total, oldest = sess.replay.total, sess.replay.oldest
+    if have < oldest or have > total:
+        if have >= 0:  # 全新客户端（have=-1）是首连，终端本来就是空的，不用 reset
+            await send_json({"type": "reset"})
+        have = oldest
+
     async def pump_out():
+        offset = have
         while True:
-            data = await anyio.to_thread.run_sync(sess.read)
-            if data:
-                await ws.send_text(data)
-            else:
-                await asyncio.sleep(0.03)
+            r = await anyio.to_thread.run_sync(
+                lambda: sess.replay.wait_from(offset, timeout=30.0))
+            if r["gap"]:
+                # 流式期间缓冲翻篇（极端）：整段重发，客户端自行重置终端
+                await send_json({"type": "reset"})
+                offset = r["oldest"]
+                continue
+            if r["chunk"]:
+                await send_json({"type": "d", "o": offset, "s": r["chunk"]})
+                offset = r["total"]
+            elif r["eof"]:
+                return  # 会话退出且读干：收泵，WS 随客户端或 pump_in 断开而关
 
     async def pump_in():
         while True:
             msg = await ws.receive_json()
-            kind = msg.get("type")
-            if kind == "input":
-                data = msg.get("data", "")
-                written = sess.write(data)
-                # 锚点只登记"整句发送"：网页输入框（结尾回车）或 bracketed-paste；
-                # 逐键输入 / 裸控制键的落盘文本不可预测，登记反而是假证据
-                if data.endswith("\r") or "\x1b[200~" in data:
-                    text = anchors.clean_payload(data)
-                    if text.strip():
-                        anchors.store.add(("mgr", sid), sess.cwd, text)
-                        # 发送回执事实源（与外部注入/广播同等待遇）；
-                        # write 失败进不了终端，不算已注入
-                        if written:
-                            promptlog.log("single", f"mgr {sid}", text,
-                                          cwd=sess.cwd or "")
-            elif kind == "ping":
-                # 应用层心跳：浏览器 WS API 发不了协议层 ping，手机切后台/弱网后
-                # 连接半开（readyState 仍是 OPEN 但实际已死），客户端靠 pong
-                # 超时判死并主动重连。pong 与 PTY 输出同为文本帧，客户端按
-                # 精确串匹配摘出，不写进终端。
-                await ws.send_text(WS_PONG)
-            elif kind == "resize":
-                sess.resize(int(msg.get("cols", 0)), int(msg.get("rows", 0)))
+            await _dispatch_ctl(sess, sid, msg, ws)
 
     try:
         await asyncio.gather(pump_out(), pump_in())
@@ -654,4 +753,5 @@ if __name__ == "__main__":
         pass
     if not os.environ.get("CRW_NO_WATCHDOG"):
         start_watchdog(PORT)
+    push.start_watcher()
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")

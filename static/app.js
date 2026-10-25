@@ -741,7 +741,6 @@ $("#btn-hist-refresh").addEventListener("click", pollHistory);
 // 应用层心跳：浏览器 WS API 发不了协议层 ping。手机切后台/弱网会把连接掐成
 // 半开（readyState 还是 OPEN 但实际死了，send 静默丢）或已关（点了发送没反应），
 // 心跳 pong 超时判死 → 主动断开走自动重连。
-const WS_PONG = '{"type":"pong"}';
 const WS_PING_MS = 15000;
 const WS_PONG_TIMEOUT = 45000;
 
@@ -758,6 +757,7 @@ async function openManaged(id) {
              brightBlack: "#6b6251", white: "#ede3d1", brightWhite: "#f6ecd9" },
   });
   state.term = term;
+  state.mgrRx = 0;  // 新终端从零起：服务端按 resume(have=0) 全量回放缓冲
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open($("#terminal"));
@@ -804,6 +804,8 @@ function connectManagedWs(id) {
     if (state.ws !== ws) return;  // 已被更新的连接取代
     state.wsAttempts = 0;
     state.lastPong = Date.now();
+    // 断连补差握手：报已收到的字符偏移，服务端只补差额（mgrRx=0 即全量回放）
+    ws.send(JSON.stringify({ type: "resume", have: state.mgrRx || 0 }));
     badge.className = "badge badge-ok"; badge.textContent = "已连接";
     if (state.mgrSendResize) state.mgrSendResize();
     startPing(ws);
@@ -819,8 +821,22 @@ function connectManagedWs(id) {
     }
   };
   ws.onmessage = (ev) => {
-    if (ev.data === WS_PONG) { state.lastPong = Date.now(); return; }  // 心跳帧不进终端
-    if (state.term) state.term.write(ev.data);
+    // 服务端只发 JSON 帧：pong/hello/reset/d（PTY 输出也封装为 d 帧带偏移）
+    let msg = null;
+    try { msg = JSON.parse(ev.data); } catch { /* 非 JSON 帧忽略 */ }
+    if (!msg) return;
+    if (msg.type === "pong") { state.lastPong = Date.now(); return; }
+    if (msg.type === "hello") return;  // 能力宣告（total/oldest 区间），无需动作
+    if (msg.type === "reset") {
+      // 断连太久缓冲翻篇：服务端将整段重发，终端先清屏对齐
+      if (state.term) { try { state.term.reset(); } catch { /* noop */ } }
+      state.mgrRx = 0;
+      return;
+    }
+    if (msg.type === "d") {
+      if (state.term) state.term.write(msg.s);
+      state.mgrRx = msg.o + msg.s.length;
+    }
   };
   ws.onclose = () => {
     if (state.ws !== ws) return;  // 旧连接的迟到回包
@@ -1514,3 +1530,68 @@ if (state.token) {
 } else {
   showGate();
 }
+
+/* ---------------- Web Push 完成通知 ---------------- */
+/* 服务端巡检 jsonl mtime：busy(45s)→idle 跳变 + 尾部 stop_reason 判定
+   （end_turn→跑完了 / tool_use→等你批准），Web Push 推送到本设备。
+   需要安全上下文（https 或 127.0.0.1）：公网 HTTP 隧道下按钮置灰提示。 */
+function urlB64ToUint8Array(s) {
+  const padding = "=".repeat((4 - (s.length % 4)) % 4);
+  const raw = atob((s + padding).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+}
+
+async function setupPushButton() {
+  const btn = $("#btn-push");
+  if (!btn) return;
+  const supported = "serviceWorker" in navigator && "PushManager" in window
+    && "Notification" in window && "caches" in window;
+  const paint = (on) => {
+    btn.style.opacity = on ? "1" : ".45";
+    btn.title = on ? "完成通知已开通（再点一次关闭本设备通知）"
+      : window.isSecureContext ? "开通完成通知：会话跑完/等你批准时推送到此设备"
+                               : "完成通知需 https 或 127.0.0.1 打开";
+  };
+  try {
+    const reg0 = supported ? await navigator.serviceWorker.getRegistration("/sw.js") : null;
+    const sub0 = reg0 ? await reg0.pushManager.getSubscription() : null;
+    paint(!!sub0);
+  } catch { paint(false); }
+  btn.addEventListener("click", async () => {
+    if (!supported) { toast("此浏览器不支持推送", true); return; }
+    if (!window.isSecureContext) {
+      toast("推送需 https 或 127.0.0.1 打开（公网隧道请用 https 地址）", true);
+      return;
+    }
+    try {
+      const reg = await navigator.serviceWorker.register("/sw.js");
+      const existing = await reg.pushManager.getSubscription();
+      if (existing) {  // 开关制：已订阅 → 关闭
+        await post("/api/push/unsubscribe", { subscription: existing.toJSON() })
+          .catch(() => null);
+        await existing.unsubscribe();
+        paint(false);
+        toast("已关闭本设备的完成通知");
+        return;
+      }
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") { toast("通知权限被拒绝，请在浏览器设置里放行", true); return; }
+      // token 交给 SW：点击通知时拼回带 token 的地址
+      const cache = await caches.open("crw-cfg");
+      await cache.put("/crw-cfg", new Response(JSON.stringify({ token: state.token }),
+        { headers: { "Content-Type": "application/json" } }));
+      const { publicKey } = await api("/api/push/vapid");
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlB64ToUint8Array(publicKey),
+      });
+      await post("/api/push/subscribe", { subscription: sub.toJSON() });
+      paint(true);
+      const r = await post("/api/push/test", {});
+      toast(r && r.sent ? "已开通，测试通知已发出 🔔" : "已开通（无订阅送达，稍后会话跑完再验证）");
+    } catch (e) {
+      toast("推送操作失败: " + (e && e.message ? e.message : e), true);
+    }
+  });
+}
+setupPushButton();
