@@ -553,7 +553,7 @@ async function pollTranscript() {
 /* ---------------- 发送回执（outbox） ---------------- */
 /* 「已注入」≠「已受理」：Claude 忙时注入文本在终端里排队，受理（落盘成记录）
    可能迟几分钟~几小时。这里把每条从会话台发出的消息的终态摆出来，跨天可查。 */
-const OB_MAX_ROWS = 6;
+const OB_MAX_ROWS = 3;  // 回执区瘦身：最新 3 条，更多由 max-height 滚动兜底
 
 function obFmtTs(iso) {
   if (!iso) return "";
@@ -849,6 +849,25 @@ function connectManagedWs(id) {
   };
 }
 
+/* 半开连接判定：readyState 是 OPEN 不代表活着——手机切后台/弱网后连接已死但
+   状态仍 OPEN，ws.send 写进死 socket 静默吞消息（2026-10-25 用户实测两条
+   「你好」只受理一条的根因）。发送前查 pong 新鲜度：健康链路每 15s 心跳，
+   pong 年龄超 20s 即判死，消息转 pendingSend + 强制重连补发，绝不盲发。 */
+const WS_SEND_STALE_MS = 20000;
+function wsFreshForSend() {
+  return !!(state.ws && state.ws.readyState === WebSocket.OPEN
+    && Date.now() - (state.lastPong || 0) < WS_SEND_STALE_MS);
+}
+function wsAlive() {
+  return !!(state.ws && state.ws.readyState === WebSocket.OPEN
+    && Date.now() - (state.lastPong || 0) < WS_PONG_TIMEOUT);
+}
+function forceReconnectManaged(id) {
+  if (state.wsRetry) { clearTimeout(state.wsRetry); state.wsRetry = null; }
+  if (state.ws) { try { state.ws.onclose = null; state.ws.close(); } catch { /* noop */ } state.ws = null; }
+  connectManagedWs(id);
+}
+
 function startPing(ws) {
   stopPing();
   state.pingTimer = setInterval(() => {
@@ -865,15 +884,15 @@ function stopPing() {
 
 function scheduleManagedReconnect(id, immediate) {
   if (state.wsRetry) { clearTimeout(state.wsRetry); state.wsRetry = null; }
-  if (state.ws) return;  // 已有连接
+  if (wsAlive()) return;  // 已有活连接；半开死链不拦，继续走强制重连
   if (!state.sel || state.sel.kind !== "mgr" || state.sel.id !== id) return;
   // 退避 2s→4s→…→15s 封顶；immediate 用于点发送时发现断链立即重连
   const delay = immediate ? 0 : Math.min(2000 * Math.max(1, state.wsAttempts), 15000);
   state.wsAttempts += 1;
   state.wsRetry = setTimeout(() => {
     state.wsRetry = null;
-    if (state.sel && state.sel.kind === "mgr" && state.sel.id === id && !state.ws) {
-      connectManagedWs(id);
+    if (state.sel && state.sel.kind === "mgr" && state.sel.id === id && !wsAlive()) {
+      forceReconnectManaged(id);
     }
   }, delay);
 }
@@ -881,8 +900,7 @@ function scheduleManagedReconnect(id, immediate) {
 /* 回到前台时若连接已死立即重连（不等退避计时器，手机解锁即恢复） */
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") return;
-  if (state.sel && state.sel.kind === "mgr"
-      && (!state.ws || state.ws.readyState !== WebSocket.OPEN)) {
+  if (state.sel && state.sel.kind === "mgr" && !wsAlive()) {
     scheduleManagedReconnect(state.sel.id, true);
   }
 });
@@ -909,13 +927,13 @@ function sendManagedInput() {
   const ta = $("#mgr-input");
   const text = ta.value;
   if (!text) return;
-  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-    // 断链时绝不能静默吞掉（手机 bug：点了发送实际没发出去，文字还留在框里）。
-    // 文字保留在输入框，记下待发内容并立即重连，onopen 里自动补发。
+  if (!wsFreshForSend()) {
+    // 断链/半开死链时绝不能静默吞掉（手机 bug：点了发送实际没发出去）。
+    // 文字保留在输入框，记下待发内容并立即强制重连，onopen 里自动补发。
     state.pendingSend = text;
     toast("连接已断开，正在重连…重连后自动补发", true);
     if (state.sel && state.sel.kind === "mgr") {
-      scheduleManagedReconnect(state.sel.id, true);
+      forceReconnectManaged(state.sel.id);
     }
     return;
   }

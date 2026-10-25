@@ -196,14 +196,16 @@ input, select, textarea { font-family: inherit; }
   border-bottom: none;
 }
 .tr-hint { color: var(--faint); font-size: 11.5px; text-align: center; padding: 4px 0 10px; letter-spacing: .05em; }
+/* 顶部提示横幅只在空记录时占位；有历史内容即让位（历史才是主展示区） */
+.transcript:has(.tr) .tr-hint { display: none; }
 .tr { display: flex; gap: 12px; padding: 9px 0; border-top: 1px dashed rgba(201,162,105,.1); }
 .tr:first-child { border-top: none; }
 .tr-who { flex: none; width: 52px; font-size: 11px; letter-spacing: .1em; padding-top: 2px; text-align: right; }
 .tr.user .tr-who { color: var(--gold); }
 .tr.assistant .tr-who { color: var(--copper); }
 .tr-body { min-width: 0; flex: 1; overflow-wrap: anywhere; }
-.tr-body p { white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 13px; }
-.tr.tool .tr-body { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+.tr-body p { white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 12px; }
+.tr.tool .tr-body { font-family: var(--mono); font-size: 11.5px; color: var(--dim); }
 .tr-tool-name { color: var(--live); }
 .tr-ts {
   display: block; margin: 3px 0 0; text-align: right;
@@ -226,7 +228,7 @@ input, select, textarea { font-family: inherit; }
   background: linear-gradient(180deg, rgba(201, 162, 105, .15), rgba(201, 162, 105, .06));
   cursor: copy;
 }
-.tr.user .tr-body p { font-size: 14px; line-height: 1.75; color: #f8f0e0; }
+.tr.user .tr-body p { font-size: 13px; line-height: 1.75; color: #f8f0e0; }
 .u-foot { display: flex; justify-content: space-between; align-items: baseline; }
 .u-foot .tr-ts { margin: 0; }
 .u-num { font-family: var(--mono); font-size: 10px; color: var(--gold-dim); }
@@ -288,9 +290,10 @@ input, select, textarea { font-family: inherit; }
 /* 每条从会话台发出的消息的受理状态：⏳ 待受理（Claude 忙时排队，可能很久）
    → ✓ 已受理（落盘 jsonl 为准）/ ✗ 注入失败。跨天可查（MySQL 持久）。 */
 .outbox {
-  margin: 0 22px 10px; padding: 8px 12px;
+  margin: 0 22px 8px; padding: 6px 10px;
   background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--radius); font-size: 12px;
+  max-height: 92px; overflow-y: auto;  /* 高度减半：约 3 行，超出滚动 */
 }
 .ob-head { color: var(--faint); letter-spacing: .08em; margin-bottom: 6px; }
 .ob-head .ob-note { letter-spacing: 0; }
