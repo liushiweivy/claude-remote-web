@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from . import injector, promptlog
+from . import anchors, injector, promptlog
 
 
 def build_pty_payload(text: str, submit: bool = True) -> str:
@@ -62,5 +62,10 @@ def run(text: str, submit: bool, external: list[dict], managed: list[dict],
         promptlog.log("broadcast", label, text, ok=bool(r.get("ok")),
                       error=r.get("error"), batch_id=batch_id,
                       target_title=t.get("title", ""), cwd=t.get("cwd", ""))
+        if r.get("ok"):
+            # 注入实证：落盘用户事件 20s 内即可凭锚点硬认领 jsonl，
+            # 失败目标不登记（文本可能根本没进终端，登记了反而是假证据）
+            key = ("ext", t["pid"]) if t["kind"] == "ext" else ("mgr", t["id"])
+            anchors.store.add(key, t.get("cwd", ""), text)
         results.append({**t, "ok": bool(r.get("ok")), "error": r.get("error")})
     return results

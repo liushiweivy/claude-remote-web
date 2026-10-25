@@ -7,7 +7,8 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from server import injector, ptyman, sessions, transcripts
+from server import anchors, injector, ptyman, sessions, transcripts
+from server import app as appmod
 from server.app import TOKEN, app
 
 
@@ -272,5 +273,98 @@ def test_managed_bad_dir_rejected():
     assert r.status_code == 400
 
 
+# ---------- 注入锚点登记（发送点实证） ----------
+
+@pytest.fixture()
+def _clear_anchors():
+    anchors.store.clear()
+    yield
+    anchors.store.clear()
+
+
+def test_single_input_registers_anchor_on_success(monkeypatch, _clear_anchors):
+    monkeypatch.setattr("server.app.sessions.session_by_pid",
+                        lambda pid: {"pid": pid, "cwd": r"E:\x", "title": "T"})
+    monkeypatch.setattr("server.app.injector.send_text",
+                        lambda pid, text, submit: {"ok": True, "events": 5})
+    r = client.post(f"/api/session/556/input?token={TOKEN}",
+                    json={"text": "锚点测试消息"})
+    assert r.status_code == 200
+    recent = anchors.store.recent(r"E:\x")
+    assert len(recent) == 1
+    assert recent[0].key == ("ext", 556) and recent[0].text == "锚点测试消息"
+
+
+def test_single_input_failure_registers_no_anchor(monkeypatch, _clear_anchors):
+    monkeypatch.setattr("server.app.sessions.session_by_pid",
+                        lambda pid: {"pid": pid, "cwd": r"E:\x", "title": "T"})
+    monkeypatch.setattr("server.app.injector.send_text",
+                        lambda pid, text, submit: {"ok": False, "error": "err=5"})
+    r = client.post(f"/api/session/557/input?token={TOKEN}",
+                    json={"text": "发不出去的消息"})
+    assert r.status_code == 200 and r.json()["ok"] is False
+    assert anchors.store.recent(r"E:\x") == []
+
+
+def test_ws_managed_input_registers_anchor(monkeypatch, _clear_anchors):
+    class _Sess:
+        cwd = r"E:\c"
+
+        def alive(self):
+            return True
+
+        def read(self):
+            return ""
+
+        def write(self, data):
+            pass
+
+        def resize(self, cols, rows):
+            pass
+
+    monkeypatch.setattr("server.app.pty_manager.get", lambda sid: _Sess())
+    with client.websocket_connect(f"/ws/managed/7?token={TOKEN}") as ws:
+        ws.send_json({"type": "input",
+                      "data": "\x1b[200~托管锚点消息\x1b[201~\r"})
+        time.sleep(0.3)  # 等 pump_in 协程处理
+    recent = anchors.store.recent(r"E:\c")
+    assert len(recent) == 1
+    assert recent[0].key == ("mgr", 7)
+    assert recent[0].text == "托管锚点消息"
+
+
 def test_index_served():
     assert client.get("/").status_code == 200
+
+
+def test_ws_managed_ping_pong(monkeypatch):
+    """手机端断链检测依赖：客户端发 {"type":"ping"} 必须收到精确 pong 帧，
+    且 pong 不会走锚点/写 PTY 的输入路径。"""
+    written = []
+
+    class _Sess:
+        cwd = r"E:\c"
+
+        def alive(self):
+            return True
+
+        def read(self):
+            return ""
+
+        def write(self, data):
+            written.append(data)
+
+        def resize(self, cols, rows):
+            pass
+
+    monkeypatch.setattr("server.app.pty_manager.get", lambda sid: _Sess())
+    with client.websocket_connect(f"/ws/managed/7?token={TOKEN}") as ws:
+        ws.send_json({"type": "ping"})
+        deadline = time.time() + 5
+        got = None
+        while time.time() < deadline:
+            got = ws.receive_text()
+            if got == appmod.WS_PONG:
+                break
+        assert got == appmod.WS_PONG
+    assert written == []  # ping 绝不进 PTY 输入

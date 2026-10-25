@@ -3,11 +3,18 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from server import broadcast, injector, promptlog
+from server import anchors, broadcast, injector, promptlog
 from server.app import TOKEN, app
 
 client = TestClient(app)
 AUTH = {"X-Auth-Token": TOKEN}
+
+
+@pytest.fixture(autouse=True)
+def _clear_anchors():
+    anchors.store.clear()
+    yield
+    anchors.store.clear()
 
 EXTERNAL = [
     {"pid": 101, "title": "甲会话", "cwd": r"E:\a", "managed": False},
@@ -78,6 +85,49 @@ def test_run_per_target_results_and_logging(monkeypatch, logged):
     assert logged[0][1]["batch_id"] == "b1" and logged[0][1]["ok"] is True
     assert logged[1][0][1] == "mgr 1"
     assert logged[1][1]["target_title"] == "" and logged[1][1]["cwd"] == r"E:\c"
+
+
+def test_run_registers_anchor_per_successful_target(monkeypatch, logged):
+    """成功注入的目标必须登记锚点（外部 ext / 托管 mgr），供 phase-0 实证认领。"""
+    monkeypatch.setattr(injector, "send_text",
+                        lambda pid, text, submit: {"ok": True})
+
+    class _Sess:
+        def alive(self):
+            return True
+
+        def write(self, data):
+            pass
+
+    broadcast.run("继续", True, EXTERNAL, MANAGED, lambda sid: _Sess(),
+                  batch_id="b-a")
+    ext_anchors = anchors.store.recent(r"E:\a")
+    mgr_anchors = anchors.store.recent(r"E:\c")
+    assert len(ext_anchors) == 1
+    assert ext_anchors[0].key == ("ext", 101) and ext_anchors[0].text == "继续"
+    assert len(mgr_anchors) == 1
+    assert mgr_anchors[0].key == ("mgr", 1)
+    assert anchors.store.recent(r"E:\b") == []  # 202 被跳过：不登记
+
+
+def test_run_failed_target_registers_no_anchor(monkeypatch, logged):
+    def _send(pid, text, submit):
+        return {"ok": False, "error": "AttachConsole 失败 (err=5)"}
+    monkeypatch.setattr(injector, "send_text", _send)
+    monkeypatch.setattr(broadcast.injector, "send_text", _send)
+
+    class _Sess:
+        def alive(self):
+            return True
+
+        def write(self, data):
+            pass
+
+    broadcast.run("x", True, EXTERNAL, MANAGED, lambda sid: _Sess(),
+                  batch_id="b-f")
+    # 101 失败不登记；909 托管成功仍登记
+    assert anchors.store.recent(r"E:\a") == []
+    assert [a.key for a in anchors.store.recent(r"E:\c")] == [("mgr", 1)]
 
 
 def test_run_single_failure_does_not_block_others(monkeypatch, logged):

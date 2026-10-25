@@ -19,7 +19,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import broadcast, injector, promptlog, quota, sessions, transcripts
+from . import (anchors, broadcast, injector, outbox, promptlog, quota,
+               session_registry, sessions, transcripts)
 from .ptyman import PtyManager
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -45,6 +46,9 @@ def _load_token() -> str:
 
 
 TOKEN = _load_token()
+
+# 托管 WS 应用层心跳应答帧（客户端按此精确串识别，与 PTY 输出区分）
+WS_PONG = '{"type":"pong"}'
 pty_manager = PtyManager()
 app = FastAPI(title="Claude Session Bridge", docs_url=None, redoc_url=None)
 
@@ -196,13 +200,46 @@ def _procs_for_resolution(external: list[dict], managed: list[dict]) -> list[dic
     return procs
 
 
+def _apply_registry(external: list[dict], managed: list[dict],
+                    resolved: dict) -> None:
+    """用 CC 官方登记（~/.claude/sessions/<pid>.json）原地覆盖时间匹配结果。
+
+    登记是 pid→sessionId 的权威事实，同 cwd 多窗口 / 跨小时 /clear 都不会错；
+    仅当登记的 jsonl 已落盘时覆盖（新会话首事件前的竞态保留时间匹配答案）。
+
+    外部会话必须先过 entry_is_live：taskkill 后登记文件会残留，pid 一旦被新
+    进程复用，陈旧登记会把新进程强行指到旧 jsonl（同 cwd 时 cwd 校验拦不住）。
+    托管会话的归属由 for_roots 的 cwd 过滤 + 最浅父链保证（root 是 cmd，其出生
+    时间与 claude 子进程本就不同，不能做时间比对）。
+    """
+    for s in external:
+        if s["managed"]:
+            continue
+        entry = session_registry.for_pid(s["pid"])
+        if entry and session_registry.entry_is_live(
+                entry, s.get("cwd"), s.get("started")):
+            hit = session_registry.resolve_entry(entry)
+            if hit:
+                resolved[("ext", s["pid"])] = hit
+    by_root = session_registry.for_roots(
+        {m["pid"]: m.get("cwd") for m in managed})
+    for m in managed:
+        entry = by_root.get(m["pid"])
+        if entry:
+            hit = session_registry.resolve_entry(entry)
+            if hit:
+                resolved[("mgr", m["id"])] = hit
+
+
 def resolve_all() -> tuple[list[dict], list[dict], dict]:
     """枚举外部 + 托管会话，并全局排他解析每个会话当前对应的 jsonl。"""
     external = sessions.list_sessions(pty_manager.root_pids(),
                                       ttl=sessions.SNAP_TTL_SEC)
     managed = pty_manager.list()
-    return external, managed, transcripts.resolve_files(
-        _procs_for_resolution(external, managed))
+    resolved = transcripts.resolve_files(
+        _procs_for_resolution(external, managed), anchors=anchors.store)
+    _apply_registry(external, managed, resolved)
+    return external, managed, resolved
 
 
 def resolve_ext_pid(pid: int) -> tuple[dict | None, dict | None]:
@@ -225,8 +262,44 @@ def resolve_ext_pid(pid: int) -> tuple[dict | None, dict | None]:
     group += [{"key": ("mgr", m["id"]), "cwd": m.get("cwd"),
                "started": m.get("started")}
               for m in managed if m.get("cwd") == same_cwd]
-    resolved = transcripts.resolve_files(group)
-    return sess, resolved.get(("ext", pid))
+    resolved = transcripts.resolve_files(group, anchors=anchors.store)
+    r = resolved.get(("ext", pid))
+    # 权威登记优先（与 resolve_all 同语义）；陈旧登记（pid 复用残留）不覆盖，
+    # 登记 jsonl 未落盘时保留时间匹配
+    entry = session_registry.for_pid(pid)
+    if entry and session_registry.entry_is_live(
+            entry, sess.get("cwd"), sess.get("started")):
+        r = session_registry.resolve_entry(entry) or r
+    return sess, r
+
+
+def resolve_mgr_sid(sid: int) -> tuple[dict | None, dict | None]:
+    """resolve_ext_pid 的托管版：只解析目标 sid 所在 cwd 组。
+
+    返回 (会话 dict, 解析结果 {"file","title"}|None)；会话不存在/已退出
+    返回 (None, None)。
+    """
+    sess = next((m for m in pty_manager.list() if m["id"] == sid), None)
+    if not sess:
+        return None, None
+    external = sessions.list_sessions(pty_manager.root_pids(),
+                                      ttl=sessions.SNAP_TTL_SEC)
+    same_cwd = sess.get("cwd")
+    group = [{"key": ("ext", s["pid"]), "cwd": s.get("cwd"),
+              "started": s.get("started")}
+             for s in external if not s["managed"]
+             and s.get("cwd") == same_cwd]
+    managed = pty_manager.list()
+    group += [{"key": ("mgr", m["id"]), "cwd": m.get("cwd"),
+               "started": m.get("started")}
+              for m in managed if m.get("cwd") == same_cwd]
+    resolved = transcripts.resolve_files(group, anchors=anchors.store)
+    r = resolved.get(("mgr", sid))
+    entry = session_registry.for_roots({sess["pid"]: sess.get("cwd")}).get(
+        sess["pid"])
+    if entry:
+        r = session_registry.resolve_entry(entry) or r
+    return sess, r
 
 
 
@@ -272,6 +345,9 @@ def post_input(pid: int, body: InputBody,
     promptlog.log("single", f"pid {pid}", body.text, ok=bool(r.get("ok")),
                   error=r.get("error"), target_title=sess.get("title") or "",
                   cwd=sess.get("cwd") or "")
+    if r.get("ok"):
+        # 注入实证：落盘事件 20s 内凭锚点硬认领，错配可被追写锚点翻盘
+        anchors.store.add(("ext", pid), sess.get("cwd") or "", body.text)
     return r
 
 
@@ -348,9 +424,34 @@ def transcript(pid: int, file: str | None = None, after: int = 0,
     if not file:
         # 无可信关联（新会话尚未发言）：明确返回未找到，前端不得借用别人的记录
         return {"events": [], "size": after, "found": False}
-    if mode == "user":  # 「只看我」：全量用户提示词，忽略 after
-        return transcripts.read_user_events(sess.get("cwd"), file)
+    if mode == "user":  # 「只看我」：全量用户提示词，忽略 after；剔除非本人键入的注入消息
+        r = transcripts.read_user_events(sess.get("cwd"), file)
+        return {**r, "events": transcripts.drop_synthetic(r["events"])}
     return transcripts.read_events(sess.get("cwd"), file, after)
+
+
+@app.get("/api/session/{pid}/outbox")
+def session_outbox(pid: int, token: str | None = Query(None),
+                   x_auth_token: str | None = Header(None)):
+    """发送回执：本会话近 36h 从会话台发出的每条消息的受理状态。"""
+    require(token, x_auth_token)
+    sess, resolved = resolve_ext_pid(pid)
+    if not sess:
+        raise HTTPException(404, "会话不存在（可能已退出）")
+    return outbox.collect(("ext", pid), sess.get("cwd"),
+                          (resolved or {}).get("file"), sess.get("started"))
+
+
+@app.get("/api/managed/{sid}/outbox")
+def managed_outbox(sid: int, token: str | None = Query(None),
+                   x_auth_token: str | None = Header(None)):
+    """托管会话的发送回执（与外部会话同语义）。"""
+    require(token, x_auth_token)
+    sess, resolved = resolve_mgr_sid(sid)
+    if not sess:
+        raise HTTPException(404, "托管会话不存在（可能已退出）")
+    return outbox.collect(("mgr", sid), sess.get("cwd"),
+                          (resolved or {}).get("file"), sess.get("started"))
 
 
 @app.get("/api/history")
@@ -366,8 +467,9 @@ def history_transcript(dir: str, file: str, after: int = 0,
                        token: str | None = Query(None),
                        x_auth_token: str | None = Header(None)):
     require(token, x_auth_token)
-    if mode == "user":  # 「只看我」：全量用户提示词，忽略 after
-        return transcripts.read_user_events_dir(dir, file)
+    if mode == "user":  # 「只看我」：全量用户提示词，忽略 after；剔除非本人键入的注入消息
+        r = transcripts.read_user_events_dir(dir, file)
+        return {**r, "events": transcripts.drop_synthetic(r["events"])}
     return transcripts.read_events_dir(dir, file, after)
 
 
@@ -439,7 +541,25 @@ async def ws_managed(ws: WebSocket, sid: int, token: str | None = Query(None)):
             msg = await ws.receive_json()
             kind = msg.get("type")
             if kind == "input":
-                sess.write(msg.get("data", ""))
+                data = msg.get("data", "")
+                written = sess.write(data)
+                # 锚点只登记"整句发送"：网页输入框（结尾回车）或 bracketed-paste；
+                # 逐键输入 / 裸控制键的落盘文本不可预测，登记反而是假证据
+                if data.endswith("\r") or "\x1b[200~" in data:
+                    text = anchors.clean_payload(data)
+                    if text.strip():
+                        anchors.store.add(("mgr", sid), sess.cwd, text)
+                        # 发送回执事实源（与外部注入/广播同等待遇）；
+                        # write 失败进不了终端，不算已注入
+                        if written:
+                            promptlog.log("single", f"mgr {sid}", text,
+                                          cwd=sess.cwd or "")
+            elif kind == "ping":
+                # 应用层心跳：浏览器 WS API 发不了协议层 ping，手机切后台/弱网后
+                # 连接半开（readyState 仍是 OPEN 但实际已死），客户端靠 pong
+                # 超时判死并主动重连。pong 与 PTY 输出同为文本帧，客户端按
+                # 精确串匹配摘出，不写进终端。
+                await ws.send_text(WS_PONG)
             elif kind == "resize":
                 sess.resize(int(msg.get("cols", 0)), int(msg.get("rows", 0)))
 
@@ -459,7 +579,10 @@ WATCHDOG_MAX_FAILURES = 3
 
 def self_health_ok(port: int, timeout: float = 5.0) -> bool:
     try:
-        with urllib.request.urlopen(
+        # 必须直连：urllib 默认读注册表系统代理（开机时 OPNANA 未启动，
+        # 7897 是死代理），走代理会连续探活失败触发看门狗自杀（2026-10-21 事故根因）。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(
                 f"http://127.0.0.1:{port}/api/health", timeout=timeout) as resp:
             return resp.status == 200
     except Exception:
@@ -491,6 +614,19 @@ def start_watchdog(port: int) -> threading.Thread:
     return t
 
 
+def replay_anchor_log() -> int:
+    """冷启动把 prompt_log 近 2h 的成功注入回放成锚点。
+
+    重启前纯时间匹配造成的错配（文件被闲置进程偷走）在首轮 resolve_files
+    即自愈；未配置 MySQL / 查询失败一律静默返回 0，不影响启动。
+
+    注意：仅在 ``python -m server.app``（__main__）启动路径调用；若改用
+    ``uvicorn server.app:app`` 拉起，需要把本调用挂到 startup 事件上。
+    """
+    rows = promptlog.recent_rows(anchors.REPLAY_WINDOW_SEC / 3600.0)
+    return anchors.store.replay(rows) if rows else 0
+
+
 def _banner() -> None:
     print("=" * 62)
     print("  Claude 会话台 已启动")
@@ -510,6 +646,12 @@ def _banner() -> None:
 if __name__ == "__main__":
     import uvicorn
     _banner()
+    try:
+        n = replay_anchor_log()
+        if n:
+            print(f"  已回放 {n} 条近期注入锚点（历史错配将在首轮解析自愈）")
+    except Exception:  # noqa: BLE001 - 回放只读且内部已降级，双保险
+        pass
     if not os.environ.get("CRW_NO_WATCHDOG"):
         start_watchdog(PORT)
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")

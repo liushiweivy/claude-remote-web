@@ -6,7 +6,7 @@
 <title>Claude 会话台 · Session Bridge</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23171410'/%3E%3Ctext x='32' y='44' font-size='38' text-anchor='middle' fill='%23c9a269' font-family='serif'%3E%E9%89%B4%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/vendor/xterm.min.css">
-<link rel="stylesheet" href="/static/styles.css?v=20261018h">
+<link rel="stylesheet" href="/static/styles.css?v=20261025a">
 </head>
 <body>
 
@@ -129,6 +129,9 @@
         <div class="tr-hint">会话记录镜像（读取本地 ~/.claude/projects，发送后自动刷新）</div>
       </div>
 
+      <!-- 发送回执：从会话台发出的消息是否被 Claude 受理（落盘为准），跨天可查 -->
+      <div id="outbox" class="outbox hidden"></div>
+
       <div class="composer">
         <textarea id="input-text" rows="2"
           placeholder="输入消息，Enter 发送（同 cmd），Shift+Enter 多行"></textarea>
@@ -138,6 +141,8 @@
             <button class="key-btn" data-key="escape" title="中断生成（同 Esc）">Esc</button>
             <button class="key-btn" data-key="ctrl_c" title="Ctrl+C">Ctrl+C</button>
           </div>
+          <button id="btn-ext-mic" class="key-btn mic-btn" type="button"
+            title="语音输入（中文，再点一次结束）">🎤</button>
           <button id="btn-send" class="btn-gold">发送 ↵</button>
         </div>
       </div>
@@ -158,6 +163,9 @@
       </header>
       <div id="terminal" class="terminal-host"></div>
 
+      <!-- 发送回执（托管会话，与外部会话同语义） -->
+      <div id="mgr-outbox" class="outbox hidden"></div>
+
       <!-- 手机端输入条（桌面端由 CSS 隐藏，桌面直接敲终端） -->
       <div id="mcomposer" class="mcomposer">
         <textarea id="mgr-input" rows="2" enterkeyhint="send"
@@ -167,6 +175,8 @@
             <button class="key-btn" data-mkey="escape" title="中断生成（同 Esc）">Esc</button>
             <button class="key-btn" data-mkey="ctrl_c" title="Ctrl+C">Ctrl+C</button>
           </div>
+          <button id="btn-mgr-mic" class="key-btn mic-btn" type="button"
+            title="语音输入（中文，再点一次结束）">🎤</button>
           <button id="btn-mgr-send" class="btn-gold">发送 ↵</button>
         </div>
       </div>
@@ -211,6 +221,6 @@
 
 <script src="/static/vendor/xterm.min.js"></script>
 <script src="/static/vendor/addon-fit.min.js"></script>
-<script src="/static/app.js?v=20261018h"></script>
+<script src="/static/app.js?v=20261025a"></script>
 </body>
 </html>

@@ -16,13 +16,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger("crw.promptlog")
 
 TABLE = "prompt_log"
+
+_TARGET_RE = re.compile(r"^(pid|mgr)\s+(\d+)$")
 
 _CREATE_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -48,7 +52,37 @@ _INSERT_SQL = (
     " %(cwd)s, %(prompt)s, %(ok)s, %(error)s)"
 )
 
+# ts 列是 MySQL 会话时区的 naive DATETIME（DEFAULT CURRENT_TIMESTAMP(3)），
+# 故窗口裁剪也用 NOW(3)（同会话时区），不能用 UTC_TIMESTAMP。
+_SELECT_RECENT_SQL = (
+    f"SELECT target, cwd, prompt, ts FROM {TABLE} "
+    "WHERE ok = 1 AND ts >= DATE_SUB(NOW(3), INTERVAL %s HOUR) "
+    "ORDER BY ts ASC"
+)
+
+# 发送回执按目标查询：含失败行（ok=0），前端要展示「✗ 注入失败」
+_SELECT_TARGET_SQL = (
+    f"SELECT ts, prompt, ok, error, cwd FROM {TABLE} "
+    "WHERE target = %s AND ts >= DATE_SUB(NOW(3), INTERVAL %s HOUR) "
+    "ORDER BY ts ASC"
+)
+
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "data" / "mysql.json"
+
+
+def _to_utc(ts) -> datetime | None:
+    """MySQL naive 墙上时间 → aware UTC。
+
+    本部署 MySQL 与本机同时区（本地 Windows MySQL），naive DATETIME 按本机
+    时区解释。若改用 UTC 时区的 MySQL（Docker 等），窗口会整体偏移，
+    届时改由 SQL 侧统一时区。
+    """
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        local_tz = datetime.now().astimezone().tzinfo
+        return ts.replace(tzinfo=local_tz).astimezone(timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 
 def new_batch_id() -> str:
@@ -135,6 +169,44 @@ class MySQLPromptLog:
     def record(self, row: dict) -> None:
         self._execute(_INSERT_SQL, row)
 
+    def recent_rows(self, hours: float = 2.0) -> list[dict]:
+        """近 hours 小时内成功注入的行（冷启动锚点回放用）。
+
+        返回 [{"kind": "ext"|"mgr", "id": int, "cwd": str,
+        "prompt": str, "ts": aware UTC datetime}]，无法解析 target 的行丢弃。
+        只读路径，任何异常都吞成空列表 —— 绝不能拖垮启动。
+        """
+        try:
+            raw = self._execute(_SELECT_RECENT_SQL, (hours,)) or []
+        except Exception:  # noqa: BLE001
+            logger.warning("📋 MySQL 读取近期提示词失败（不影响启动）",
+                           exc_info=True)
+            return []
+        rows = []
+        for target, cwd, prompt, ts in raw:
+            m = _TARGET_RE.match((target or "").strip())
+            if not m or not ts:
+                continue
+            rows.append({
+                "kind": "ext" if m.group(1) == "pid" else "mgr",
+                "id": int(m.group(2)),
+                "cwd": cwd or "",
+                "prompt": prompt or "",
+                "ts": _to_utc(ts),
+            })
+        return rows
+
+    def recent_for_target(self, target: str, hours: float = 36.0) -> list[dict]:
+        """某目标近 hours 小时的全部注入行（含 ok=0 失败行），发送回执用。
+
+        返回 [{"ts": aware UTC, "prompt", "ok": bool, "error", "cwd"}]，
+        按注入时间升序。只读路径，查询失败抛给模块级入口降级。
+        """
+        raw = self._execute(_SELECT_TARGET_SQL, (target, hours)) or []
+        return [{"ts": _to_utc(ts), "prompt": prompt or "",
+                 "ok": bool(ok), "error": error or None, "cwd": cwd or ""}
+                for ts, prompt, ok, error, cwd in raw if ts]
+
 
 # ---------------- 单例与降级 ----------------
 
@@ -172,6 +244,28 @@ def reset_store() -> None:
     with _store_lock:
         _store = None
         _tried = False
+
+
+def recent_rows(hours: float = 2.0) -> list[dict]:
+    """模块级只读入口：未配置/不可用时返回 []（冷启动回放必须无感降级）。"""
+    try:
+        store = _get_store()
+        return store.recent_rows(hours) if store is not None else []
+    except Exception:  # noqa: BLE001
+        logger.warning("📋 读取近期提示词失败（不影响启动）", exc_info=True)
+        return []
+
+
+def recent_for_target(target: str, hours: float = 36.0) -> list[dict] | None:
+    """模块级只读入口：未配置/不可用时返回 None（调用方据此降级到内存锚点）。"""
+    try:
+        store = _get_store()
+        if store is None:
+            return None
+        return store.recent_for_target(target, hours)
+    except Exception:  # noqa: BLE001
+        logger.warning("📋 读取目标提示词失败（回执降级到内存锚点）", exc_info=True)
+        return None
 
 
 def log(source: str, target: str, prompt: str, ok: bool = True,

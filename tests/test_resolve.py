@@ -8,10 +8,20 @@ import json
 import os
 from datetime import datetime, timezone, timedelta
 
-from server import sessions, transcripts
+import pytest
+
+from server import anchors, sessions, transcripts
 
 # 测试基准时间（UTC 存储，与 jsonl timestamp 一致）
 T0 = datetime(2026, 10, 16, 0, 34, 28, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _clear_claim_cache():
+    """冻结认领缓存按 Anchor 值命中，跨用例相同锚点会串状态，每例清空。"""
+    transcripts._clear_claim_cache()
+    yield
+    transcripts._clear_claim_cache()
 
 
 def _iso(dt: datetime) -> str:
@@ -56,6 +66,7 @@ def _setup(tmp_path, monkeypatch, files):
         _write_jsonl(proj / name, **kwargs)
     monkeypatch.setattr(transcripts, "PROJECTS_DIR", tmp_path)
     transcripts._file_cache.clear()
+    transcripts._meta_cache.clear()  # 同名同尺寸假文件跨用例可能命中陈旧头解析
 
 
 def test_two_procs_two_files_each_own(tmp_path, monkeypatch):
@@ -343,3 +354,450 @@ def test_round1_owned_old_files_not_stolen_by_round2(tmp_path, monkeypatch):
     res = transcripts.resolve_files(procs)
     assert res[("ext", 100)]["file"] == "a.jsonl"  # 最新 session
     assert res[("ext", 200)]["file"] == "r.jsonl"
+
+
+# ---------- 注入锚点 phase-0（2026-10-21 二代串台修复） ----------
+
+def _write_events_jsonl(path, events, *, mtime: datetime):
+    """造含多条用户事件的 jsonl：events=[(ts, text), ...]，首事件决定 first_ts。"""
+    lines = [
+        json.dumps({"type": "user", "timestamp": _iso(ts),
+                    "message": {"content": text}}, ensure_ascii=False)
+        for ts, text in events]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.utime(path, (mtime.timestamp(), mtime.timestamp()))
+
+
+def _anchor_store(*specs):
+    """specs: (key, cwd, text, ts)；测试时间是固定历史时刻，给极长 ttl 防剪枝
+    （因此用例不能依赖真实 anchors._now 过期，只可 monkeypatch transcripts._now_utc）。"""
+    st = anchors.AnchorStore(default_ttl=10 ** 9)
+    for key, cwd, text, ts in specs:
+        st.add(key, cwd, text, ts=ts)
+    return st
+
+
+def test_anchor_append_overturns_wrong_guess(tmp_path, monkeypatch):
+    """追写锚点翻盘（现网 24580/26340 案）：老进程 4h 后在新文件发言，
+    新启动的闲置进程靠第二轮 mtime 偷走文件；锚点必须把文件硬判给注入目标，
+    偷文件的进程诚实回到 None。"""
+    b_ts = T0 + timedelta(hours=4)
+    _setup(tmp_path, monkeypatch, {
+        "a.jsonl": {"first_ts": T0 + timedelta(seconds=100), "title": "旧会话",
+                    "mtime": T0 + timedelta(minutes=20)},
+    })
+    _write_events_jsonl(
+        tmp_path / "C--Users-4v" / "b.jsonl",
+        [(b_ts, "目前效果怎么样")], mtime=b_ts + timedelta(seconds=1))
+    procs = _procs((100, T0), (200, T0 + timedelta(hours=4, seconds=-10)))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "目前效果怎么样",
+         b_ts - timedelta(milliseconds=300)))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] == "b.jsonl"
+    assert res[("ext", 200)]["file"] is None
+
+
+def test_anchor_birth_sole_new_file_cjk_doubling(tmp_path, monkeypatch):
+    """出生锚点 + 叠字容错（现网 21308/23924 案）：老进程新开会话产生新文件，
+    CONIN$ 中文叠字导致文本不一致，但 20s 窗内只有这一个新文件 → 仍归老进程；
+    同组的闲置新进程不得偷取。"""
+    b_ts = T0 + timedelta(hours=4, minutes=16)
+    _setup(tmp_path, monkeypatch, {
+        "a.jsonl": {"first_ts": T0 + timedelta(seconds=100), "title": "旧会话",
+                    "mtime": T0 + timedelta(minutes=20)},
+    })
+    _write_events_jsonl(
+        tmp_path / "C--Users-4v" / "b.jsonl",
+        [(b_ts, "奇奇怪怪我我在在会会话话台台")],
+        mtime=b_ts + timedelta(seconds=1))
+    procs = _procs((100, T0), (200, T0 + timedelta(hours=4, minutes=10)))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "奇怪我在会话台",
+         b_ts - timedelta(milliseconds=80)))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] == "b.jsonl"
+    assert res[("ext", 200)]["file"] is None
+
+
+def test_anchor_birth_multiple_new_files_require_text(tmp_path, monkeypatch):
+    """窗内有两个新文件且文本都对不上（叠字 squeeze 也不匹配）→ 不得瞎认。"""
+    b1_ts = T0 + timedelta(hours=4)
+    b2_ts = b1_ts + timedelta(seconds=5)
+    _setup(tmp_path, monkeypatch, {})
+    _write_events_jsonl(tmp_path / "C--Users-4v" / "b1.jsonl",
+                        [(b1_ts, "完全不同的内容甲")], mtime=b1_ts)
+    _write_events_jsonl(tmp_path / "C--Users-4v" / "b2.jsonl",
+                        [(b2_ts, "完全不同的内容乙")], mtime=b2_ts)
+    procs = _procs((100, T0))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "注入文本XYZ",
+         b1_ts - timedelta(milliseconds=100)))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] is None
+
+
+def test_two_anchors_pair_exclusively_by_nearest_event(tmp_path, monkeypatch):
+    """同 cwd 两个注入目标、两条几乎同时落盘的用户事件：按事件-锚点时间差
+    排他配对，各回各家（广播/连续单发场景）。"""
+    t1 = T0 + timedelta(minutes=30)
+    t2 = t1 + timedelta(seconds=10)
+    _setup(tmp_path, monkeypatch, {})
+    _write_events_jsonl(tmp_path / "C--Users-4v" / "f1.jsonl",
+                        [(t1, "甲会话专属消息")], mtime=t1)
+    _write_events_jsonl(tmp_path / "C--Users-4v" / "f2.jsonl",
+                        [(t2, "乙会话专属消息")], mtime=t2)
+    procs = _procs((100, T0), (200, T0 + timedelta(seconds=5)))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "甲会话专属消息",
+         t1 - timedelta(milliseconds=100)),
+        (("ext", 200), r"C:\Users\4v", "乙会话专属消息",
+         t2 - timedelta(milliseconds=100)))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] == "f1.jsonl"
+    assert res[("ext", 200)]["file"] == "f2.jsonl"
+
+
+def test_anchor_does_not_claim_across_cwd(tmp_path, monkeypatch):
+    """锚点只在登记的 cwd 内认领文件；别的 cwd 完全不受影响。"""
+    for cwd_enc in ("C--Users-4v", "E--1workspace"):
+        (tmp_path / cwd_enc).mkdir(exist_ok=True)
+    t1 = T0 + timedelta(minutes=5)
+    _write_events_jsonl(tmp_path / "E--1workspace" / "f.jsonl",
+                        [(t1, "别的项目的消息")], mtime=t1)
+    monkeypatch.setattr(transcripts, "PROJECTS_DIR", tmp_path)
+    transcripts._file_cache.clear()
+    transcripts._meta_cache.clear()  # 同名同尺寸假文件跨用例可能命中陈旧头解析
+    procs = [
+        {"key": ("ext", 1), "cwd": r"C:\Users\4v", "started": _iso(T0)},
+        {"key": ("ext", 2), "cwd": r"E:\1workspace", "started": _iso(T0)},
+    ]
+    store = _anchor_store(
+        (("ext", 1), r"C:\Users\4v", "别的项目的消息",
+         t1 - timedelta(milliseconds=100)))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 1)]["file"] is None       # 锚点 cwd 无文件
+    assert res[("ext", 2)]["file"] == "f.jsonl"  # 走常规第一轮，未被锚点干预
+
+
+def test_anchor_claims_file_even_without_anchor_store(tmp_path, monkeypatch):
+    """anchors=None（旧调用约定/未回放场景）行为与以前完全一致。"""
+    _setup(tmp_path, monkeypatch, {
+        "a.jsonl": {"first_ts": T0 + timedelta(seconds=12), "title": "甲",
+                    "mtime": T0 + timedelta(minutes=20)},
+        "b.jsonl": {"first_ts": T0 + timedelta(seconds=97), "title": "乙",
+                    "mtime": T0 + timedelta(minutes=20)},
+    })
+    procs = _procs((100, T0), (200, T0 + timedelta(seconds=66)))
+    res = transcripts.resolve_files(procs)
+    assert res[("ext", 100)]["file"] == "a.jsonl"
+    assert res[("ext", 200)]["file"] == "b.jsonl"
+
+
+# ---------- 第二轮 mtime 匹配 30 分钟封顶 ----------
+
+def test_round2_capped_at_lookback_window(tmp_path, monkeypatch):
+    """无锚点时，homeless 进程不得靠第二轮无限回溯认领 4h 后才被写的文件。"""
+    _setup(tmp_path, monkeypatch, {
+        "late.jsonl": {"first_ts": T0 - timedelta(days=1), "title": "迟来的",
+                       "mtime": T0 + timedelta(hours=4)},
+    })
+    procs = _procs((100, T0))
+    res = transcripts.resolve_files(procs)
+    assert res[("ext", 100)]["file"] is None
+
+
+def test_round2_short_resume_gap_still_claims(tmp_path, monkeypatch):
+    """封顶不误伤正常 resume：启动 30s 后续写的旧文件照常匹配。"""
+    _setup(tmp_path, monkeypatch, {
+        "r.jsonl": {"first_ts": T0 - timedelta(days=1), "title": "resume 的",
+                    "mtime": T0 + timedelta(seconds=30)},
+    })
+    procs = _procs((100, T0))
+    res = transcripts.resolve_files(procs)
+    assert res[("ext", 100)]["file"] == "r.jsonl"
+
+
+# ---------- 代码审查回归（2026-10-21 下午，锚点 v2） ----------
+
+def test_replay_anchor_for_dead_pid_does_not_starve_live_proc(tmp_path, monkeypatch):
+    """MED-1：回放锚点指向已退出 pid 时，只占池不产结果 —— 它认领的文件
+    必须继续留在两轮池里，让同 cwd 存活的 resume 进程正常匹配。"""
+    ev_ts = T0 + timedelta(seconds=40)
+    _setup(tmp_path, monkeypatch, {})
+    _write_events_jsonl(tmp_path / "C--Users-4v" / "b.jsonl",
+                        [(ev_ts, "回放锚点存活文本XYZ")],
+                        mtime=ev_ts + timedelta(seconds=1))
+    procs = _procs((200, T0))  # 锚点目标 ("ext", 999) 已死，200 活着
+    store = _anchor_store(
+        (("ext", 999), r"C:\Users\4v", "回放锚点存活文本XYZ",
+         ev_ts - timedelta(milliseconds=300)))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 200)]["file"] == "b.jsonl"
+
+
+def test_birth_claim_requires_text_corroboration(tmp_path, monkeypatch):
+    """MED-2：窗内唯一新文件，但首条用户文本与注入文本（含 squeeze）完全
+    对不上 → 不得出生认领；文件回到两轮池归真正在本地打字的进程。"""
+    b_ts = T0 + timedelta(hours=4, minutes=16)
+    _setup(tmp_path, monkeypatch, {
+        "a.jsonl": {"first_ts": T0 + timedelta(seconds=100), "title": "旧会话",
+                    "mtime": T0 + timedelta(minutes=20)},
+    })
+    _write_events_jsonl(
+        tmp_path / "C--Users-4v" / "b.jsonl",
+        [(b_ts, "本地手打的第一条完全不同内容")],
+        mtime=b_ts + timedelta(seconds=1))
+    procs = _procs((100, T0), (200, T0 + timedelta(hours=4, minutes=10)))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "注入串台测试XYZ",
+         b_ts - timedelta(milliseconds=80)))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] == "a.jsonl"  # 锚点未碰 b，旧会话仍归 100
+    assert res[("ext", 200)]["file"] == "b.jsonl"  # 本地新文件回到真主人
+
+
+def _patch_clock(monkeypatch, now):
+    monkeypatch.setattr(transcripts, "_now_utc", lambda: now)
+
+
+def test_closed_window_anchor_freezes_claim_without_rescan(tmp_path, monkeypatch):
+    """MED-3：匹配窗关闭后锚点决定冻结（含正/负结果），后续 resolve 不再
+    整扫任何文件；冻结的认领照样把文件硬判给注入目标。"""
+    now0 = datetime.now(timezone.utc).replace(microsecond=0)
+    _setup(tmp_path, monkeypatch, {
+        "a.jsonl": {"first_ts": now0 - timedelta(hours=4), "title": "旧会话",
+                    "mtime": now0 - timedelta(hours=3, minutes=40)},
+    })
+    _write_events_jsonl(
+        tmp_path / "C--Users-4v" / "b.jsonl",
+        [(now0, "冻结锚点测试消息ABC")], mtime=now0 + timedelta(seconds=1))
+    procs = _procs((100, now0 - timedelta(hours=4)),
+                   (200, now0 - timedelta(seconds=30)))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "冻结锚点测试消息ABC",
+         now0 - timedelta(milliseconds=300)))
+
+    scans: list[str] = []
+    real_read = transcripts.read_user_events
+
+    def counting_read(cwd, file):
+        scans.append(file)
+        return real_read(cwd, file)
+
+    monkeypatch.setattr(transcripts, "read_user_events", counting_read)
+
+    # t1：窗还开着（注入后 1s），事件已落盘 → 文本边认领，整扫发生
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=1))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] == "b.jsonl"
+    assert res[("ext", 200)]["file"] is None
+    assert scans == ["b.jsonl"]
+
+    # 文件继续被写（活跃会话），t2 窗刚关闭 → 冻结正认领
+    _write_events_jsonl(
+        tmp_path / "C--Users-4v" / "b.jsonl",
+        [(now0, "冻结锚点测试消息ABC"),
+         (now0 + timedelta(seconds=30), "后续对话另一条内容")],
+        mtime=now0 + timedelta(seconds=30))
+    scans.clear()
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=25))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] == "b.jsonl"
+    assert res[("ext", 200)]["file"] is None
+
+    # t3：此后每个轮询都直接吃缓存，零整扫 —— 15min TTL 内不再有热路径成本
+    scans.clear()
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=60))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] == "b.jsonl"
+    assert res[("ext", 200)]["file"] is None
+    assert scans == []
+
+
+def test_frozen_negative_anchor_not_rescanned(tmp_path, monkeypatch):
+    """MED-3：窗关闭时没有任何文本对上的锚点冻结为"无认领"（负缓存），
+    后续轮询零整扫，也不会随文件续写突然乱认。"""
+    now0 = datetime.now(timezone.utc).replace(microsecond=0)
+    _setup(tmp_path, monkeypatch, {})
+    _write_events_jsonl(
+        tmp_path / "C--Users-4v" / "b.jsonl",
+        [(now0, "完全不相干的本地对话内容")],
+        mtime=now0 + timedelta(seconds=1))
+    procs = _procs((100, now0 - timedelta(hours=4)))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "另一条注入文本XYZ",
+         now0 - timedelta(milliseconds=300)))
+    scans: list[str] = []
+    real_read = transcripts.read_user_events
+    monkeypatch.setattr(
+        transcripts, "read_user_events",
+        lambda cwd, file: (scans.append(file), real_read(cwd, file))[1])
+
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=25))  # 已关窗
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] is None
+    assert scans == ["b.jsonl"]
+
+    scans.clear()
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=60))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] is None
+    assert scans == []
+
+
+def test_frozen_claim_released_when_owner_pid_exits(tmp_path, monkeypatch):
+    """冻结认领只对仍存活的属主有效：属主进程退出后，文件回到池里，
+    交给同 cwd 下真正还活着的进程（锚点按组内 live key 过滤）。"""
+    now0 = datetime.now(timezone.utc).replace(microsecond=0)
+    _setup(tmp_path, monkeypatch, {})
+    _write_events_jsonl(
+        tmp_path / "C--Users-4v" / "b.jsonl",
+        [(now0, "属主退出测试消息ABC")], mtime=now0 + timedelta(seconds=1))
+    both = _procs((100, now0 - timedelta(hours=4)),
+                  (200, now0 - timedelta(seconds=30)))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "属主退出测试消息ABC",
+         now0 - timedelta(milliseconds=300)))
+
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=25))
+    res = transcripts.resolve_files(both, anchors=store)
+    assert res[("ext", 100)]["file"] == "b.jsonl"  # 已冻结
+
+    alive = _procs((200, now0 - timedelta(seconds=30)))  # 100 已退出
+    res = transcripts.resolve_files(alive, anchors=store)
+    assert res[("ext", 200)]["file"] == "b.jsonl"
+
+
+def test_frozen_claim_skipped_when_file_gone(tmp_path, monkeypatch):
+    """冻结认领指向的文件已被删除（会话清理）→ 跳过，不得产生幽灵归属，
+    其余文件照常走两轮匹配。"""
+    now0 = datetime.now(timezone.utc).replace(microsecond=0)
+    proj = tmp_path / "C--Users-4v"
+    _setup(tmp_path, monkeypatch, {
+        "a.jsonl": {"first_ts": now0 - timedelta(seconds=90), "title": "甲",
+                    "mtime": now0 - timedelta(seconds=80)},
+    })
+    _write_events_jsonl(proj / "b.jsonl",
+                        [(now0, "文件即将消失测试消息")],
+                        mtime=now0 + timedelta(seconds=1))
+    procs = _procs((100, now0 - timedelta(seconds=100)))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "文件即将消失测试消息",
+         now0 - timedelta(milliseconds=300)))
+
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=25))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] == "b.jsonl"
+
+    (proj / "b.jsonl").unlink()
+    transcripts._file_cache.clear()
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] == "a.jsonl"
+
+
+# ---------- 代码审查回归（2026-10-21 晚，冻结缓存边界） ----------
+
+def test_negative_freeze_waits_grace_for_late_flush(tmp_path, monkeypatch):
+    """负冻结宽限：事件时间戳落在窗内（ts+19.9s）但落盘晚于首个关窗
+    轮询（ts+21s）时，None 不得立即冻结 —— 宽限内事件补扫到必须能认。"""
+    now0 = datetime.now(timezone.utc).replace(microsecond=0)
+    _setup(tmp_path, monkeypatch, {})
+    _write_events_jsonl(
+        tmp_path / "C--Users-4v" / "b.jsonl",
+        [(now0 + timedelta(seconds=1), "无关本地对话内容")],
+        mtime=now0 + timedelta(seconds=1))
+    procs = _procs((100, now0 - timedelta(hours=4)))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "宽限补扫测试消息ABC", now0))
+    anchor = store.recent(r"C:\Users\4v")[0]
+
+    # t1 = 注入后 21s：窗刚关 1s，尚无匹配事件 → 不认，但负结果也不冻结
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=21))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] is None
+    assert anchor not in transcripts._claim_cache
+
+    # 事件（时间戳 ts+19.9s，窗内）此刻才刷盘
+    _write_events_jsonl(
+        tmp_path / "C--Users-4v" / "b.jsonl",
+        [(now0 + timedelta(seconds=1), "无关本地对话内容"),
+         (now0 + timedelta(seconds=19, milliseconds=900), "宽限补扫测试消息ABC")],
+        mtime=now0 + timedelta(seconds=22))
+
+    # t2 = 22s（仍在 +5s 宽限内）→ 补扫到窗内事件，正认领并冻结
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=22))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] == "b.jsonl"
+    assert transcripts._claim_cache.get(anchor) == "b.jsonl"
+
+
+def test_negative_freezes_after_grace_and_holds(tmp_path, monkeypatch):
+    """宽限（+5s）过后仍无匹配事件才冻结 None；冻结后零整扫且不乱认。"""
+    now0 = datetime.now(timezone.utc).replace(microsecond=0)
+    _setup(tmp_path, monkeypatch, {})
+    _write_events_jsonl(
+        tmp_path / "C--Users-4v" / "b.jsonl",
+        [(now0 + timedelta(seconds=1), "无关本地对话内容")],
+        mtime=now0 + timedelta(seconds=1))
+    procs = _procs((100, now0 - timedelta(hours=4)))
+    store = _anchor_store(
+        (("ext", 100), r"C:\Users\4v", "宽限后冻结测试消息ABC",
+         now0 - timedelta(milliseconds=200)))
+    anchor = store.recent(r"C:\Users\4v")[0]
+
+    scans: list[str] = []
+    real_read = transcripts.read_user_events
+    monkeypatch.setattr(
+        transcripts, "read_user_events",
+        lambda cwd, file: (scans.append(file), real_read(cwd, file))[1])
+
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=26))  # 已过 25s 宽限
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] is None
+    assert transcripts._claim_cache.get(anchor) is None
+
+    scans.clear()
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=60))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 100)]["file"] is None
+    assert scans == []  # 负冻结生效，零整扫
+
+
+def test_commit_frozen_sticky_positive_never_downgraded():
+    """并发：迟到的陈旧负扫描（None）不得覆盖先到的正认领；None→正允许升级。"""
+    now = datetime.now(timezone.utc)
+    anchor = anchors.Anchor(
+        key=("ext", 1), cwd="", ts=now, text="x",
+        expires_at=now + timedelta(hours=1))
+    transcripts._commit_frozen({anchor: "b.jsonl"}, now)
+    assert transcripts._claim_cache[anchor] == "b.jsonl"
+    transcripts._commit_frozen({anchor: None}, now + timedelta(seconds=1))
+    assert transcripts._claim_cache[anchor] == "b.jsonl"  # 正认领不被降级
+
+    other = anchors.Anchor(
+        key=("ext", 2), cwd="", ts=now, text="y",
+        expires_at=now + timedelta(hours=1))
+    transcripts._commit_frozen({other: None}, now)
+    transcripts._commit_frozen({other: "c.jsonl"}, now + timedelta(seconds=1))
+    assert transcripts._claim_cache[other] == "c.jsonl"  # 负→正允许升级
+
+
+def test_anchor_resolves_session_with_unknown_start_time(tmp_path, monkeypatch):
+    """started=None（PEB 取不到启动时间）的进程，其锚点仍须能硬认领文件：
+    锚点自带属主 key，不依赖时间轮。"""
+    now0 = datetime.now(timezone.utc).replace(microsecond=0)
+    proj = tmp_path / "C--Users-4v"
+    proj.mkdir()
+    _write_events_jsonl(proj / "b.jsonl",
+                        [(now0 + timedelta(milliseconds=300), "无启动时间锚点测试ABC")],
+                        mtime=now0 + timedelta(seconds=1))
+    monkeypatch.setattr(transcripts, "PROJECTS_DIR", tmp_path)
+    transcripts._file_cache.clear()
+    transcripts._meta_cache.clear()
+    procs = [{"key": ("ext", 77), "cwd": r"C:\Users\4v", "started": None}]
+    store = _anchor_store(
+        (("ext", 77), r"C:\Users\4v", "无启动时间锚点测试ABC", now0))
+    _patch_clock(monkeypatch, now0 + timedelta(seconds=1))
+    res = transcripts.resolve_files(procs, anchors=store)
+    assert res[("ext", 77)]["file"] == "b.jsonl"

@@ -157,8 +157,10 @@ input, select, textarea { font-family: inherit; }
 /* ---------- 主舞台 ---------- */
 .stage { position: relative; min-width: 0; min-height: 0; display: grid; grid-template-rows: 1fr; }
 /* minmax(0,1fr)：单列轨道默认 auto 会被长英文/路径撑宽，连带底部按钮溢出 */
-.view { display: grid; grid-template-rows: auto auto 1fr auto; grid-template-columns: minmax(0, 1fr); min-width: 0; min-height: 0; }
-#view-managed { grid-template-rows: auto 1fr; }
+/* 末两行依次是 发送回执 / 输入区（回执隐藏时不占行）；历史视图只用前三行 */
+.view { display: grid; grid-template-rows: auto auto 1fr auto auto; grid-template-columns: minmax(0, 1fr); min-width: 0; min-height: 0; }
+/* 桌面托管：头 / 终端 / 回执（输入条 display:none 不占行） */
+#view-managed { grid-template-rows: auto 1fr auto; }
 
 .empty-state { align-self: center; justify-self: center; text-align: center; color: var(--dim); padding: 40px; }
 .empty-glyph { font-size: 44px; opacity: .5; margin-bottom: 14px; }
@@ -282,6 +284,32 @@ input, select, textarea { font-family: inherit; }
 .trg-result { color: var(--faint); white-space: normal; }
 .trg-error { color: var(--danger); }
 
+/* ---------- 发送回执 ---------- */
+/* 每条从会话台发出的消息的受理状态：⏳ 待受理（Claude 忙时排队，可能很久）
+   → ✓ 已受理（落盘 jsonl 为准）/ ✗ 注入失败。跨天可查（MySQL 持久）。 */
+.outbox {
+  margin: 0 22px 10px; padding: 8px 12px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); font-size: 12px;
+}
+.ob-head { color: var(--faint); letter-spacing: .08em; margin-bottom: 6px; }
+.ob-head .ob-note { letter-spacing: 0; }
+.ob-row {
+  display: flex; align-items: baseline; gap: 8px; padding: 3px 0;
+  border-top: 1px dashed rgba(201, 162, 105, 0.08);
+}
+.ob-row:first-of-type { border-top: none; }
+.ob-st { flex-shrink: 0; font-family: var(--mono); font-size: 11px; }
+.ob-ok { color: var(--live); }
+.ob-pending { color: var(--gold); }
+.ob-bad { color: var(--danger); }
+.ob-ts { flex-shrink: 0; color: var(--faint); font-family: var(--mono); font-size: 11px; }
+.ob-text {
+  color: var(--dim); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; min-width: 0;
+}
+.ob-pending-row .ob-text { color: var(--text); }
+
 /* ---------- 输入区 ---------- */
 .composer {
   margin: 0 22px 20px; padding: 12px;
@@ -302,7 +330,14 @@ input, select, textarea { font-family: inherit; }
   border-radius: 6px; padding: 5px 11px; font-family: var(--mono); font-size: 12px;
 }
 .key-btn:hover { color: var(--copper); border-color: var(--line-strong); }
-#btn-send { margin-left: auto; min-width: 104px; padding: 8px 18px; }
+#btn-send { margin-left: 7px; min-width: 104px; padding: 8px 18px; }
+#btn-mgr-send { margin-left: 7px; }
+/* 语音输入：margin-left:auto 把它和发送键一起推到输入条右侧 */
+.mic-btn { margin-left: auto; font-size: 14px; padding: 6px 10px; }
+.mic-btn:disabled { opacity: .35; cursor: not-allowed; }
+.mic-btn:disabled:hover { color: var(--dim); border-color: var(--line); }
+.mic-btn.rec { color: #d05a4a; border-color: #d05a4a; animation: mic-pulse 1.2s infinite; }
+@keyframes mic-pulse { 50% { box-shadow: 0 0 0 4px rgba(208, 90, 74, .22); } }
 
 /* ---------- 终端 ---------- */
 .terminal-host {
@@ -568,8 +603,9 @@ input, select, textarea { font-family: inherit; }
   .tr-who { width: 40px; }
   .tr { gap: 8px; }
 
-  /* 托管终端页：头部 / 终端 / 输入条 三段 */
-  #view-managed { grid-template-rows: auto 1fr auto; }
+  /* 托管终端页：头部 / 终端 / 回执 / 输入条 四段 */
+  #view-managed { grid-template-rows: auto 1fr auto auto; }
+  .outbox { margin: 0 10px 8px; }
   .mcomposer {
     display: block; flex: none;
     margin: 0 10px calc(10px + env(safe-area-inset-bottom)); padding: 10px;

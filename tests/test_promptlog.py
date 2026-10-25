@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """promptlog：配置加载 / 建表 / 写入 / 降级（fake pymysql，不碰真 MySQL）。"""
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -23,13 +24,14 @@ class _FakeCursor:
         self.conn.executed.append((sql, params))
 
     def fetchall(self):
-        return []
+        return list(self.conn.fake.rows)
 
 
 class _FakeConn:
-    def __init__(self, tracker, kwargs):
+    def __init__(self, fake, kwargs):
+        self.fake = fake
         self.kwargs = kwargs
-        self.executed = tracker
+        self.executed = fake.executed
 
     def __enter__(self):
         return self
@@ -48,13 +50,14 @@ class FakePymysql:
         self.executed = []
         self.connects = []
         self.fail_times = fail_times
+        self.rows = []  # fetchall() 对所有查询返回的行（测试按场景设置）
 
     def connect(self, **kwargs):
         self.connects.append(kwargs)
         if self.fail_times > 0:
             self.fail_times -= 1
             raise OSError("fake connect error")
-        return _FakeConn(self.executed, kwargs)
+        return _FakeConn(self, kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -139,6 +142,57 @@ def test_log_mysql_down_is_noop(tmp_path, monkeypatch):
     monkeypatch.setattr(promptlog, "MySQLPromptLog",
                         lambda cfg: (_ for _ in ()).throw(OSError("down")))
     promptlog.log("single", "pid 1", "提示词")  # 不抛异常即通过
+
+
+# ---------- recent_rows：冷启动锚点回放的只读查询 ----------
+
+def test_recent_rows_sql_filter_and_target_parsing():
+    fake = FakePymysql()
+    naive_ts = datetime(2026, 10, 21, 12, 41, 2)  # MySQL 存本机墙上时间（naive）
+    fake.rows = [
+        ("pid 24580", r"E:\1workspace", "目前效果怎么样", naive_ts),
+        ("mgr 2", r"C:\Users\4v", "托管会话注入", naive_ts),
+        ("wechat 9", r"E:\x", "无法解析的目标", naive_ts),
+    ]
+    store = promptlog.MySQLPromptLog(CFG, pymysql_mod=fake)
+    rows = store.recent_rows(hours=2)
+    select = [s for s, _ in fake.executed if "FROM prompt_log" in s][0]
+    params = [p for s, p in fake.executed if "FROM prompt_log" in s][0]
+    assert "ok = 1" in select or "ok=1" in select
+    assert "INTERVAL %s HOUR" in select
+    assert params == (2,)
+    assert len(rows) == 2  # "wechat 9" 不可解析，丢弃
+    assert rows[0]["kind"] == "ext" and rows[0]["id"] == 24580
+    assert rows[0]["cwd"] == r"E:\1workspace" and rows[0]["prompt"] == "目前效果怎么样"
+    assert rows[1]["kind"] == "mgr" and rows[1]["id"] == 2
+    # naive 本机时间被解释成本地时区并转成 aware UTC
+    assert rows[0]["ts"].tzinfo is not None
+    local_tz = datetime.now().astimezone().tzinfo
+    expected = naive_ts.replace(tzinfo=local_tz).astimezone(timezone.utc)
+    assert rows[0]["ts"] == expected and rows[1]["ts"] == expected
+
+
+def test_recent_rows_module_fn_degrades_without_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(promptlog, "_CONFIG_PATH", tmp_path / "none.json")
+    assert promptlog.recent_rows() == []  # 不抛异常即通过
+
+
+def test_recent_rows_query_failure_returns_empty():
+    class _BoomCursor(_FakeCursor):
+        def fetchall(self):
+            raise OSError("connection lost")
+
+    class _BoomConn(_FakeConn):
+        def cursor(self):
+            return _BoomCursor(self)
+
+    class BoomPymysql(FakePymysql):
+        def connect(self, **kwargs):
+            self.connects.append(kwargs)
+            return _BoomConn(self, kwargs)
+
+    store = promptlog.MySQLPromptLog(CFG, pymysql_mod=BoomPymysql())
+    assert store.recent_rows() == []  # 重试一次后吞掉，冷启动绝不因此挂掉
 
 
 def test_log_truncates_long_fields(tmp_path, monkeypatch):

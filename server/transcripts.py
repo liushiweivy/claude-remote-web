@@ -8,8 +8,10 @@ import re
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from .anchors import MATCH_WINDOW_SEC, text_matches
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 TAIL_BYTES = 128 * 1024
@@ -45,6 +47,55 @@ FILE_CACHE_TTL = 20.0
 # 单文件头部解析缓存：{cwd_key: {filename: ((mtime_ns, size), title, preview, first_ts_iso)}}
 # 活跃会话爆发写入时指纹会让目录级缓存失效，但未变化的绝大多数文件不必重读头部。
 _meta_cache: dict[str, dict[str, tuple]] = {}
+
+# 锚点冻结认领缓存：{Anchor: fname | None}。匹配窗关闭（now >= ts+20s）后，
+# 窗内事件早已落盘，认领决定不会再变 —— 冻结后每个轮询直接套用，不再整扫
+# 活跃大文件（实测 8.2MB 文件单次整扫 70-100ms，每 2.5s 一次）。None 是负缓存：
+# 窗内确实没有匹配事件，后续也不会变。锚点过期即随提交清理；按 Anchor 值命中，
+# 属主进程退出时该锚点在组内被 live-key 过滤，缓存自然不生效。
+_claim_cache: dict = {}
+_claim_cache_lock = threading.Lock()
+CLAIM_CACHE_MAX = 2048
+# 负冻结宽限：首个关窗轮询落在 [ts+20, ts+22.5]，窗内最后 ~0.5s
+# 的事件可能正在刷盘；None 多等 5s 再冻结，正认领立即冻结
+NEGATIVE_FREEZE_GRACE_SEC = 5.0
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _snapshot_frozen(anchor_list: list, now: datetime) -> dict[int, str | None]:
+    """命中冻结缓存的锚点 → {anchor_list 下标: fname 或 None}。"""
+    with _claim_cache_lock:
+        return {i: _claim_cache[a] for i, a in enumerate(anchor_list)
+                if a in _claim_cache}
+
+
+def _commit_frozen(new: dict, now: datetime) -> None:
+    """把关窗锚点本轮的决定（含 None 负缓存）写入冻结表，顺手剪过期/限容。"""
+    if not new:
+        return
+    with _claim_cache_lock:
+        for a, verdict in new.items():
+            # 正认领粘性：并发 resolve 时迟到的陈旧负扫描（事件刷盘前扫的）
+            # 不得把先到的正认领覆盖成 None；None→正的升级允许
+            if verdict is None and _claim_cache.get(a) is not None:
+                continue
+            _claim_cache[a] = verdict
+        for a in [a for a in _claim_cache if a.expires_at <= now]:
+            del _claim_cache[a]
+        if len(_claim_cache) > CLAIM_CACHE_MAX:  # 极端长稳跑兜底：留最新的
+            keep = set(sorted(_claim_cache, key=lambda a: a.ts,
+                              reverse=True)[:CLAIM_CACHE_MAX])
+            for a in list(_claim_cache):
+                if a not in keep:
+                    del _claim_cache[a]
+
+
+def _clear_claim_cache() -> None:
+    with _claim_cache_lock:
+        _claim_cache.clear()
 
 
 def encode_cwd(cwd: str) -> str:
@@ -183,14 +234,18 @@ def _file_title(f: dict) -> str | None:
     return f.get("title") or f.get("preview")
 
 
-def resolve_files(procs: list[dict]) -> dict:
+def resolve_files(procs: list[dict], anchors=None) -> dict:
     """进程 ↔ jsonl 全局排他解析（同 cwd 多会话防串台的核心）。
 
     procs: [{"key": 任意可哈希标识, "cwd": str|None, "started": iso 字符串}]
+    anchors: anchors.AnchorStore|None —— 有注入锚点时先做 phase-0 硬认领。
     返回 {key: {"file": 文件名|None, "title": str|None}}。
     没有可信证据时 file 为 None —— 调用方必须诚实显示"等待首条消息"，
     绝不允许借用别的会话文件（旧 choose_file 的 files[0] 兜底即串台根因）。
 
+    phase-0（注入实证，见 _phase0_claims）：服务端自己注入的文本在 20s 内
+    落盘到哪个文件，文件就硬归注入目标，可推翻两轮时间匹配的错配猜测；
+    锚点只对本组仍存活的属主生效，关窗后决定冻结，不反复整扫文件。
     两轮都走"最大化被服务进程数"的排他匹配（见 _assign_exclusive）：
     第一轮（创建证据）：文件首事件落在 [启动-2s, 启动+30min] 窗口内即有边，
     1:1 主匹配保证每个活进程优先各得一个文件 —— 晚启动的进程即使 gap 略大，
@@ -200,14 +255,16 @@ def resolve_files(procs: list[dict]) -> dict:
     session 的旧文件），进程"当前文件"取首事件最晚者。
     第二轮（续写证据，resume/无时间戳头）：第一轮无文件的进程，对"启动后
     被写过、且第一轮无人拥有"的旧文件按 mtime gap 做同样的排他匹配，
-    同一进程拿到多个时以 mtime 最新者为当前文件。
+    gap 同样封顶在 MAX_LOOKBACK_GAP_SEC（30min）—— 超时宁可诚实返回 None，
+    也不许闲置进程无限回溯偷走老进程里新开的会话（2026-10-21 串台路径二），
+    注入场景由 phase-0 锚点覆盖。同一进程拿到多个时以 mtime 最新者为当前文件。
     """
     result = {p["key"]: {"file": None, "title": None} for p in procs}
     groups: dict[str, list[dict]] = defaultdict(list)
     for p in procs:
         groups[p.get("cwd") or ""].append(p)
     for cwd, plist in groups.items():
-        _resolve_group(cwd, plist, result)
+        _resolve_group(cwd, plist, result, anchor_store=anchors)
     return result
 
 
@@ -345,7 +402,137 @@ def _attach_remaining(cands: list[tuple[int, float, int]], primary: dict[int, in
     return {i: j for i, (c, j) in best.items() if i not in taken}
 
 
-def _resolve_group(cwd: str | None, plist: list[dict], result: dict) -> None:
+def _phase0_claims(cwd: str | None, anchor_list: list, files: list[dict],
+                   now: datetime | None = None):
+    """注入锚点 phase-0 硬认领（2026-10-21 二代串台修复）。
+
+    服务端精确知道注入时刻/目标/文本，落盘用户事件在 MATCH_WINDOW_SEC 内
+    带着一致文本出现，是比时间启发式强得多的归属证据：
+
+    - 追写锚点：锚点文本在窗内出现在某文件的用户事件里 → 硬认领该文件，
+      即使两轮时间匹配此前把它错配给了别的进程（文件直接移出后续匹配池）。
+    - 出生锚点：窗内只有一个新文件（first_ts 落在注入时刻附近），且其首条
+      用户文本 squeeze 后对得上才认 —— 既覆盖 CONIN$ 中文逐字叠写
+      （libuv 双消费），又防止把同刻本地打字的另一进程首文件错认给锚点。
+    - 多锚点按 |事件-锚点| 时间差升序贪心，跨属主排他（同属主可重复认领
+      同一文件：多条注入进同一会话）；一个锚点至多认领一个文件。
+    - 匹配窗关闭后的锚点决定被冻结（_claim_cache，含负结果）：窗内事件
+      早已落盘，结论不变，后续轮询零整扫。
+
+    anchor_list 只含本组存活属主的锚点（调用方按 live key 过滤）。
+    返回 (claimed_names:set[str], owned:{key: [(first_ts, file_dict)]})。
+    """
+    now = now or _now_utc()
+    by_name = {f["file"]: f for f in files}
+    first_dt = {f["file"]: (datetime.fromisoformat(f["first_ts"])
+                            if f["first_ts"] else None) for f in files}
+    mtime_dt = {f["file"]: datetime.fromisoformat(f["mtime"]) for f in files}
+    user_events: dict[str, list] = {}
+
+    def events_for(fname: str) -> list:
+        if fname not in user_events:  # read_user_events 按文件签名缓存
+            user_events[fname] = read_user_events(cwd, fname)["events"]
+        return user_events[fname]
+
+    claimed: dict[str, object] = {}
+    win: dict[int, str] = {}  # 已决锚点 ai -> 认领文件名（冻结命中或本轮新判）
+
+    # 1) 冻结锚点：按注入时间升序直接套用旧决定；文件已删/属主撞车则跳过
+    frozen = _snapshot_frozen(anchor_list, now)
+    for ai in sorted(frozen):
+        fname = frozen[ai]
+        if fname is None or fname not in by_name:
+            continue
+        anchor = anchor_list[ai]
+        owner = claimed.get(fname)
+        if owner is not None and owner != anchor.key:
+            continue
+        claimed[fname] = anchor.key
+        win[ai] = fname
+
+    # 2) 未冻结锚点：mtime 预筛 + 整扫文本边（窗内事件）
+    text_edges: list[tuple[float, int, object, str]] = []
+    for ai, anchor in enumerate(anchor_list):
+        if ai in frozen:
+            continue
+        lo = anchor.ts - timedelta(seconds=MATCH_WINDOW_SEC)
+        for f in files:
+            if mtime_dt[f["file"]] < lo:
+                continue  # 廉价元数据预筛：锚点窗内没被写过的文件不整扫
+            best: float | None = None
+            for ev in events_for(f["file"]):
+                raw_ts = ev.get("ts")
+                if not raw_ts:
+                    continue
+                try:
+                    ets = _parse_ts(raw_ts)
+                except ValueError:
+                    continue
+                delta = (ets - anchor.ts).total_seconds()
+                if abs(delta) <= MATCH_WINDOW_SEC \
+                        and text_matches(anchor.text, ev.get("text", "")):
+                    ad = abs(delta)
+                    if best is None or ad < best:
+                        best = ad
+            if best is not None:
+                text_edges.append((best, ai, anchor, f["file"]))
+
+    anchors_done: set[int] = set()
+    text_edges.sort(key=lambda e: (e[0], e[1]))
+    for _d, ai, anchor, fname in text_edges:
+        if ai in anchors_done:
+            continue
+        owner = claimed.get(fname)
+        if owner is not None and owner != anchor.key:
+            continue  # 更准的锚点已把文件判给别的属主，不抢
+        claimed[fname] = anchor.key
+        anchors_done.add(ai)
+        win[ai] = fname
+
+    # 3) 出生锚点：窗内全局唯一新文件（多文件必须文本边），且首条用户
+    #    文本 squeeze 后对得上 —— 时间巧合但内容无关的本地首消息不许错认
+    for ai, anchor in enumerate(anchor_list):
+        if ai in frozen or ai in anchors_done:
+            continue
+        newborn = [f["file"] for f in files
+                   if first_dt[f["file"]] is not None
+                   and -START_TOLERANCE_SEC
+                   <= (first_dt[f["file"]] - anchor.ts).total_seconds()
+                   <= MATCH_WINDOW_SEC]
+        if len(newborn) != 1 or newborn[0] in claimed:
+            continue
+        first_events = events_for(newborn[0])
+        first_text = first_events[0].get("text", "") if first_events else ""
+        if text_matches(anchor.text, first_text):
+            claimed[newborn[0]] = anchor.key
+            anchors_done.add(ai)
+            win[ai] = newborn[0]
+
+    # 4) 决定落盘冻结，活跃文件续写导致签名失效也不再反复整扫：
+    #    正认领立即冻结；负结果（None）多等 NEGATIVE_FREEZE_GRACE_SEC，
+    #    给窗内最后时刻事件的刷盘留时间（首个关窗轮询可能早于刷盘）
+    closed = {}
+    for ai in range(len(anchor_list)):
+        if ai in frozen:
+            continue
+        anchor = anchor_list[ai]
+        verdict = win.get(ai)
+        edge = anchor.ts + timedelta(seconds=MATCH_WINDOW_SEC)
+        if verdict is not None:
+            closed[anchor] = verdict
+        elif now >= edge + timedelta(seconds=NEGATIVE_FREEZE_GRACE_SEC):
+            closed[anchor] = None
+    _commit_frozen(closed, now)
+
+    owned: dict = defaultdict(list)
+    for fname, key in claimed.items():
+        ft = first_dt[fname] or mtime_dt[fname]
+        owned[key].append((ft, by_name[fname]))
+    return set(claimed), owned
+
+
+def _resolve_group(cwd: str | None, plist: list[dict], result: dict,
+                   anchor_store=None) -> None:
     files = list_files_cached(cwd)
     if not files:
         return
@@ -353,7 +540,29 @@ def _resolve_group(cwd: str | None, plist: list[dict], result: dict) -> None:
     for p in plist:
         if p.get("started"):
             starts[p["key"]] = datetime.fromisoformat(p["started"]).astimezone(timezone.utc)
+
+    # ---- phase-0：注入锚点硬认领，命中文件直接移出两轮匹配池 ----
+    # 放在 starts 空判断之前：锚点自带属主 key，PEB 取不到启动时间的进程
+    # （started=None）两轮匹配本就无证据，锚点是它唯一的归属手段。
+    anchor_owned: dict = defaultdict(list)
+    if anchor_store is not None:
+        live_keys = {p["key"] for p in plist}
+        # 回放锚点可能指向已退出 pid：死属主永不出结果，只会把文件移出活
+        # 进程的匹配池（resume 场景被饿死），一律过滤
+        anchor_list = [a for a in anchor_store.recent(cwd or "")
+                       if a.key in live_keys]
+        if anchor_list:
+            claimed_names, anchor_owned = _phase0_claims(cwd, anchor_list, files)
+            if claimed_names:
+                files = [f for f in files if f["file"] not in claimed_names]
+
     if not starts:
+        # 全组进程启动时间未知：两轮时间匹配无法进行，只兑现锚点认领
+        for key, lst in anchor_owned.items():
+            if key in result and lst:
+                lst.sort(key=lambda x: x[0])
+                f = lst[-1][1]
+                result[key] = {"file": f["file"], "title": _file_title(f)}
         return
     # 确定性顺序：文件按首事件时间、进程按启动时间；平手时匹配结果可复现
     keys = sorted(starts, key=lambda k: (starts[k], str(k)))
@@ -380,7 +589,10 @@ def _resolve_group(cwd: str | None, plist: list[dict], result: dict) -> None:
     extra_rows = _attach_remaining(
         [(row_of[fi], c, j) for fi, c, j in cands], primary_rows)
 
-    owned: dict = defaultdict(list)  # key -> [(first_ts, file_dict)]
+    # phase-0 锚点文件作为属主的初始拥有物；它们已移出匹配池，两轮不会再碰
+    owned: dict = defaultdict(list)
+    for key, lst in anchor_owned.items():
+        owned[key].extend(lst)
     for ri, j in primary_rows.items():
         fi, ft = born[ri]
         owned[keys[j]].append((ft, files[fi]))
@@ -407,7 +619,9 @@ def _resolve_group(cwd: str | None, plist: list[dict], result: dict) -> None:
             row: list[float | None] = []
             for j, key in enumerate(homeless):
                 delta = (mt - starts[key]).total_seconds()
-                if delta < -START_TOLERANCE_SEC:
+                # 与第一轮同一封顶：gap > 30min 不许靠 mtime 回溯偷新文件，
+                # 宁可诚实返回 None（注入场景有 phase-0 锚点，不靠这里）
+                if delta < -START_TOLERANCE_SEC or delta > MAX_LOOKBACK_GAP_SEC:
                     row.append(None)
                 else:
                     c = max(delta, 0.0)
@@ -428,7 +642,9 @@ def _resolve_group(cwd: str | None, plist: list[dict], result: dict) -> None:
             current[key] = lst[-1][1]
 
     for key, f in current.items():
-        result[key] = {"file": f["file"], "title": _file_title(f)}
+        # 双保险：锚点已按 live key 过滤，理论上 key 必在 result 内
+        if key in result:
+            result[key] = {"file": f["file"], "title": _file_title(f)}
 
 
 def _tool_detail(name: str, inp: dict) -> str:
@@ -507,6 +723,40 @@ def parse_line(ln: str) -> dict | None:
                 return {"role": "assistant", "kind": "text",
                         "text": "\n".join(texts), "ts": ts}
     return None
+
+
+# 「只看我」视图剔除的非人工键入消息前缀（harness/agent 注入）。
+# 一律 strip 后前缀匹配：用户打字内容里提到这些词（如"出现<task-notification>…"）不中招。
+_SYNTHETIC_PREFIXES = (
+    "<task-notification",              # 后台任务完成通知
+    "<system-reminder",                # 系统提醒注入
+    "<command-",                       # 斜杠命令回显（command-name/message/args）
+    "<local-command",                  # 本地命令输出回显
+    "<cross-session-message",          # 跨会话消息投递
+    "<bash-",                          # bash-input/bash-output 包装
+    "Caveat:",                         # 续写摘要的免责前缀
+    "This session is being continued",  # 上下文耗尽自动续会话的总结注入
+)
+_IMAGE_LINE_RE = re.compile(r"\[Image[^\n]*\]")
+
+
+def is_synthetic_prompt(text: str) -> bool:
+    """这条"用户消息"是否非本人键入（harness/agent 注入的占位/通知/摘要）。
+
+    「只看我」视图据此整段剔除。图片例外：以 [Image…] 占位开头但后面还有
+    真人文字的（贴图+说明）保留；纯图片占位剔除。
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    if t.startswith("[Image"):
+        return not _IMAGE_LINE_RE.sub("", t).strip()
+    return t.startswith(_SYNTHETIC_PREFIXES)
+
+
+def drop_synthetic(events: list[dict]) -> list[dict]:
+    """只看我视图出口：剔除非人工键入的用户消息（见 is_synthetic_prompt）。"""
+    return [e for e in events if not is_synthetic_prompt(e.get("text") or "")]
 
 
 def _read_complete(path: Path, start: int, end: int) -> tuple[list[str], int]:

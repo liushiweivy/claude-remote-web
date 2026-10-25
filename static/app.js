@@ -13,6 +13,11 @@ const state = {
   tr: { file: null, after: 0, first: true, events: [], expanded: new Set() },
   htr: null,                    // 历史回看的转写状态（结构与 tr 同形，互不干扰）
   ws: null, term: null, fit: null,
+  wsRetry: null, wsAttempts: 0,   // 托管 WS 自动重连：退避计时器与次数
+  pingTimer: null, lastPong: 0,   // 应用层心跳（半开死链检测）
+  pendingSend: null,              // 断线时点发送的消息：重连成功后自动补发
+  mgrSendResize: null,            // 当前托管会话的尺寸同步函数（重连后 onopen 调）
+  obInflight: false,              // 发送回执轮询去重
   entered: false,
   quota: { data: null },
 };
@@ -134,9 +139,10 @@ async function pollSessions() {
     renderLists();
     if (state.sel && state.sel.kind === "ext") {
       const cur = currentExt();
-      // 后端从"无关联"变为"已关联"（首条消息落盘）且用户没手动选过文件
-      // → 自动切到正确的记录，修掉"发了消息看不到回复"的错觉。
-      if (cur && cur.file && !state.tr.file && !state.tr.manual && !state.tr.loading) {
+      // 后端 chosen 与当前展示文件不一致（首条消息落盘 / 锚点翻盘错配）
+      // 且用户没手动选过文件 → 自动切到正确的记录；手动选择永远尊重。
+      if (cur && cur.file && cur.file !== state.tr.file
+          && !state.tr.manual && !state.tr.loading) {
         openExternal(cur.pid);
       } else {
         pollTranscript();
@@ -169,6 +175,8 @@ async function openExternal(pid) {
   state.tr = { file: null, after: 0, first: true, manual: false, loading: true,
                events: [], expanded: new Set(),
                filter: localStorage.getItem("crw_tf") || "all" };
+  $("#outbox").classList.add("hidden");  // 切会话即清旧回执，pollOutbox 重填
+  $("#outbox").innerHTML = "";
   $("#transcript").innerHTML = `<div class="tr-hint">加载会话记录…</div>`;
   $("#probe-badge").className = "badge badge-unknown";
   $("#probe-badge").textContent = "未探测";
@@ -192,6 +200,7 @@ async function openExternal(pid) {
       : `<option value="">无会话记录</option>`;
     state.tr.file = info.chosen;
     state.tr.loading = false;
+    pollOutbox();
     if (!info.chosen) {
       // 后端没有可信关联（新会话尚未发言 / resume 尚无写入）：
       // 明确提示并等待自动关联，绝不展示别的会话的记录。
@@ -210,6 +219,7 @@ const AI_COLLAPSE_CHARS = 520;  // AI 文本超此长度且能切出非空中段
 const AI_CLIP_CHARS = 260;      // 首段、尾段各最多保留字符
 const AI_CLIP_LINES = 8;        // 首段、尾段各最多保留行数
 const USER_COLLAPSE_CHARS = 360; // 「只看我」模式下提示词超此长度截断头部（其余模式不截）
+const USER_HIDE_CHARS = 1000;   // 「只看我」模式下超此长度的提示词整段不展示（不截断、不渲染）
 const TR_MAX_EVENTS = 220;
 
 function trFmtTs(ev) {
@@ -268,9 +278,11 @@ function aiClips(text) {
 // 只看AI=客户端滤出 AI 正文（隐藏工具过程与我的发言）。
 function renderFilterBar(tr) {
   const f = tr.filter || "all";
-  const userN = tr.events.filter((e) => e.role === "user" && e.kind === "text").length;
+  // 计数口径与渲染一致：超 USER_HIDE_CHARS 的整段不展示，不计入
+  const userN = tr.events.filter((e) => e.role === "user" && e.kind === "text"
+    && (e.text || "").length <= USER_HIDE_CHARS).length;
   return `<div class="tr-filter">
-    ${f === "user" ? `<span class="tf-info">${userN} 条提示词 · 长文已截断（点 ▾ 展开）· 点卡片复制全文</span>` : ""}
+    ${f === "user" ? `<span class="tf-info">${userN} 条提示词 · 长文已截断（点 ▾ 展开）· 超 ${USER_HIDE_CHARS} 字或系统注入消息（任务通知/图片占位等）整段不展示 · 点卡片复制全文</span>` : ""}
     <span class="tf-group" role="group" aria-label="记录过滤">
       <button type="button" class="tf-btn${f === "all" ? " on" : ""}" data-tf="all">全部</button>
       <button type="button" class="tf-btn${f === "user" ? " on" : ""}" data-tf="user">只看我</button>
@@ -394,8 +406,11 @@ function renderTranscriptInto(box, tr) {
   for (let i = 0; i < evs.length;) {
     const ev = evs[i];
     if (filter === "user") {
-      // 服务端已只回用户提示词，这里再滤一道兜底
-      if (ev.role === "user" && ev.kind === "text") parts.push(renderUser(ev, ++userSeq, tr));
+      // 服务端已只回用户提示词，这里再滤一道兜底；超 USER_HIDE_CHARS 的整段不展示
+      if (ev.role === "user" && ev.kind === "text"
+          && (ev.text || "").length <= USER_HIDE_CHARS) {
+        parts.push(renderUser(ev, ++userSeq, tr));
+      }
       i++;
     } else if (filter === "ai") {
       if (ev.role === "assistant" && ev.kind === "text") {
@@ -535,6 +550,74 @@ async function pollTranscript() {
   }
 }
 
+/* ---------------- 发送回执（outbox） ---------------- */
+/* 「已注入」≠「已受理」：Claude 忙时注入文本在终端里排队，受理（落盘成记录）
+   可能迟几分钟~几小时。这里把每条从会话台发出的消息的终态摆出来，跨天可查。 */
+const OB_MAX_ROWS = 6;
+
+function obFmtTs(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  return d.toLocaleString("zh-CN", sameDay
+    ? { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" }
+    : { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function obRow(it) {
+  let st;
+  if (it.status === "acked") {
+    st = `<span class="ob-st ob-ok">✓ 已受理 ${obFmtTs(it.ack_ts)}</span>`;
+  } else if (it.status === "failed") {
+    st = `<span class="ob-st ob-bad" title="${esc(it.error || "")}">✗ 注入失败</span>`;
+  } else {
+    st = `<span class="ob-st ob-pending"
+      title="已注入终端；Claude 忙时消息会排队，受理后（出现在上方记录里）自动打勾">⏳ 待受理</span>`;
+  }
+  const text = (it.text || "").replace(/\s+/g, " ").trim();
+  const cls = it.status === "pending" ? " ob-pending-row" : "";
+  return `<div class="ob-row${cls}">${st}<span class="ob-ts">${obFmtTs(it.ts)}</span>
+    <span class="ob-text" title="${esc(it.text || "")}">${esc(text.slice(0, 60))}</span></div>`;
+}
+
+function renderOutbox(box, data, stale) {
+  const items = (data.items || []).slice(-OB_MAX_ROWS).reverse();
+  if (!items.length && !stale) { box.classList.add("hidden"); box.innerHTML = ""; return; }
+  box.classList.remove("hidden");
+  const notes = [];
+  if (stale) notes.push("会话已退出，以下为退出前状态");
+  if (data && data.persistent === false) notes.push("未配置 MySQL，仅保留近期记录");
+  box.innerHTML = `<div class="ob-head">发送回执
+    ${notes.length ? `<span class="ob-note">（${esc(notes.join("；"))}）</span>` : ""}</div>`
+    + items.map(obRow).join("");
+}
+
+async function pollOutbox() {
+  if (!state.sel || state.obInflight) return;
+  const kind = state.sel.kind, id = state.sel.id;
+  if (kind !== "ext" && kind !== "mgr") return;
+  const box = $(kind === "ext" ? "#outbox" : "#mgr-outbox");
+  const url = kind === "ext" ? `/api/session/${id}/outbox` : `/api/managed/${id}/outbox`;
+  state.obInflight = true;
+  try {
+    const data = await api(url);
+    if (!state.sel || state.sel.kind !== kind || state.sel.id !== id) return;
+    renderOutbox(box, data, false);
+  } catch (e) {
+    // 404 = 会话已退出：保留最后一份回执（第二天来查的场景），只加陈旧标注
+    if (/不存在|已退出/.test(e.message || "") && box.innerHTML) {
+      const head = box.querySelector(".ob-head");
+      if (head && !head.querySelector(".ob-note")) {
+        head.insertAdjacentHTML("beforeend",
+          `<span class="ob-note">（会话已退出，以下为退出前状态）</span>`);
+      }
+    }
+  } finally {
+    state.obInflight = false;
+  }
+}
+
 $("#transcript-select").addEventListener("change", (e) => {
   state.tr.file = e.target.value || null;
   state.tr.after = 0;
@@ -572,9 +655,14 @@ async function sendInput() {
     if (r.ok) {
       ta.value = "";
       $("#probe-badge").className = "badge badge-ok";
-      $("#probe-badge").textContent = `已注入 PID ${pid} ✓`;
+      // 注入成功 ≠ Claude 已受理（忙时排队）：终态看下方「发送回执」
+      $("#probe-badge").textContent = `已注入 PID ${pid}，待受理…`;
+      pollOutbox();  // prompt_log 同步落库，立即可见 pending 行
       // 记录还没关联时刷新会话列表（后端发现新 jsonl 后会自动切到正确记录）
-      setTimeout(hadFile ? pollTranscript : pollSessions, 1800);
+      setTimeout(() => {
+        (hadFile ? pollTranscript : pollSessions)();
+        pollOutbox();
+      }, 1800);
     } else toast(r.error || "注入失败", true);
   } catch (caused) { toast(caused.message, true); }
 }
@@ -650,6 +738,13 @@ async function pollHistTranscript() {
 $("#btn-hist-refresh").addEventListener("click", pollHistory);
 
 /* ---------------- 托管会话 / xterm ---------------- */
+// 应用层心跳：浏览器 WS API 发不了协议层 ping。手机切后台/弱网会把连接掐成
+// 半开（readyState 还是 OPEN 但实际死了，send 静默丢）或已关（点了发送没反应），
+// 心跳 pong 超时判死 → 主动断开走自动重连。
+const WS_PONG = '{"type":"pong"}';
+const WS_PING_MS = 15000;
+const WS_PONG_TIMEOUT = 45000;
+
 async function openManaged(id) {
   const s = state.managed.find((x) => x.id === id);
   $("#mgr-title").textContent = s
@@ -668,24 +763,19 @@ async function openManaged(id) {
   term.open($("#terminal"));
   requestAnimationFrame(() => { try { fit.fit(); } catch { /* 容器未稳定 */ } });
 
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/managed/${id}?token=${encodeURIComponent(state.token)}`);
-  state.ws = ws;
-  ws.onopen = () => {
-    $("#ws-badge").className = "badge badge-ok"; $("#ws-badge").textContent = "已连接";
-    sendResize();
-  };
-  ws.onmessage = (ev) => term.write(ev.data);
-  ws.onclose = () => { $("#ws-badge").className = "badge badge-bad"; $("#ws-badge").textContent = "已断开"; };
-  term.onData((d) => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "input", data: d })); });
+  // 终端输入走 state.ws 现查：重连换新连接后旧闭包不会把输入写进死 WS
+  term.onData((d) => {
+    if (state.ws && state.ws.readyState === WebSocket.OPEN)
+      state.ws.send(JSON.stringify({ type: "input", data: d }));
+  });
   let lastDims = "";
   const sendResize = () => {
-    if (ws.readyState !== 1) return;
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
     try { fit.fit(); } catch { return; }
     const dims = term.cols + "x" + term.rows;
     if (dims === lastDims) return;   // 尺寸未变不回发，防止 observer 回环
     lastDims = dims;
-    ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+    state.ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
   };
   window.addEventListener("resize", sendResize);
   const resizeObserver = new ResizeObserver(sendResize);
@@ -696,10 +786,99 @@ async function openManaged(id) {
     window.removeEventListener("resize", sendResize);
     resizeObserver.disconnect();
   };
+  state.mgrSendResize = sendResize;  // 重连换新 WS 后 onopen 要重同步尺寸
+  $("#mgr-outbox").classList.add("hidden");  // 切会话即清旧回执
+  $("#mgr-outbox").innerHTML = "";
+  connectManagedWs(id);
+  pollOutbox();
 }
+
+function connectManagedWs(id) {
+  if (state.ws) { try { state.ws.onclose = null; state.ws.close(); } catch { /* noop */ } state.ws = null; }
+  const badge = $("#ws-badge");
+  badge.className = "badge badge-unknown"; badge.textContent = "连接中…";
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/managed/${id}?token=${encodeURIComponent(state.token)}`);
+  state.ws = ws;
+  ws.onopen = () => {
+    if (state.ws !== ws) return;  // 已被更新的连接取代
+    state.wsAttempts = 0;
+    state.lastPong = Date.now();
+    badge.className = "badge badge-ok"; badge.textContent = "已连接";
+    if (state.mgrSendResize) state.mgrSendResize();
+    startPing(ws);
+    // 断线期间点过发送：重连成功自动补发（输入框原文未被清空）
+    if (state.pendingSend && state.sel && state.sel.kind === "mgr" && state.sel.id === id) {
+      const pending = state.pendingSend;
+      state.pendingSend = null;
+      ws.send(JSON.stringify({ type: "input", data: pending.replace(/\r/g, "") + "\r" }));
+      const ta = $("#mgr-input");
+      if (ta.value === pending) ta.value = "";
+      toast("已重连并自动补发 ✓");
+      setTimeout(pollOutbox, 400);
+    }
+  };
+  ws.onmessage = (ev) => {
+    if (ev.data === WS_PONG) { state.lastPong = Date.now(); return; }  // 心跳帧不进终端
+    if (state.term) state.term.write(ev.data);
+  };
+  ws.onclose = () => {
+    if (state.ws !== ws) return;  // 旧连接的迟到回包
+    state.ws = null;
+    stopPing();
+    badge.className = "badge badge-bad"; badge.textContent = "已断开，重连中…";
+    if (state.sel && state.sel.kind === "mgr" && state.sel.id === id) {
+      scheduleManagedReconnect(id, false);
+    }
+  };
+}
+
+function startPing(ws) {
+  stopPing();
+  state.pingTimer = setInterval(() => {
+    if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "ping" }));
+    if (Date.now() - state.lastPong > WS_PONG_TIMEOUT) {
+      try { ws.close(); } catch { /* noop */ }  // 半开死链：触发 onclose 走重连
+    }
+  }, WS_PING_MS);
+}
+function stopPing() {
+  if (state.pingTimer) { clearInterval(state.pingTimer); state.pingTimer = null; }
+}
+
+function scheduleManagedReconnect(id, immediate) {
+  if (state.wsRetry) { clearTimeout(state.wsRetry); state.wsRetry = null; }
+  if (state.ws) return;  // 已有连接
+  if (!state.sel || state.sel.kind !== "mgr" || state.sel.id !== id) return;
+  // 退避 2s→4s→…→15s 封顶；immediate 用于点发送时发现断链立即重连
+  const delay = immediate ? 0 : Math.min(2000 * Math.max(1, state.wsAttempts), 15000);
+  state.wsAttempts += 1;
+  state.wsRetry = setTimeout(() => {
+    state.wsRetry = null;
+    if (state.sel && state.sel.kind === "mgr" && state.sel.id === id && !state.ws) {
+      connectManagedWs(id);
+    }
+  }, delay);
+}
+
+/* 回到前台时若连接已死立即重连（不等退避计时器，手机解锁即恢复） */
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (state.sel && state.sel.kind === "mgr"
+      && (!state.ws || state.ws.readyState !== WebSocket.OPEN)) {
+    scheduleManagedReconnect(state.sel.id, true);
+  }
+});
 
 function closeManagedWs() {
   if (state.managedCleanup) { try { state.managedCleanup(); } catch { /* noop */ } state.managedCleanup = null; }
+  if (state.wsRetry) { clearTimeout(state.wsRetry); state.wsRetry = null; }
+  stopPing();
+  // 切走即放弃待发：后台迟到的补发比"没发出去"更迷惑
+  state.pendingSend = null;
+  state.wsAttempts = 0;
+  state.mgrSendResize = null;
   if (state.ws) { try { state.ws.onclose = null; state.ws.close(); } catch { /* noop */ } state.ws = null; }
   if (state.term) { try { state.term.dispose(); } catch { /* noop */ } state.term = null; }
   $("#terminal").innerHTML = "";
@@ -713,11 +892,22 @@ document.querySelectorAll("[data-back]").forEach((b) =>
 function sendManagedInput() {
   const ta = $("#mgr-input");
   const text = ta.value;
-  if (!text || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  if (!text) return;
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    // 断链时绝不能静默吞掉（手机 bug：点了发送实际没发出去，文字还留在框里）。
+    // 文字保留在输入框，记下待发内容并立即重连，onopen 里自动补发。
+    state.pendingSend = text;
+    toast("连接已断开，正在重连…重连后自动补发", true);
+    if (state.sel && state.sel.kind === "mgr") {
+      scheduleManagedReconnect(state.sel.id, true);
+    }
+    return;
+  }
   // 与 xterm 粘贴路径一致：原文 + 回车（Claude 输入框支持多行粘贴）
   state.ws.send(JSON.stringify({ type: "input", data: text.replace(/\r/g, "") + "\r" }));
   ta.value = "";
   ta.focus();
+  setTimeout(pollOutbox, 400);  // 服务端落库后立即可见 pending 回执
 }
 $("#btn-mgr-send").addEventListener("click", sendManagedInput);
 $("#mgr-input").addEventListener("keydown", (e) => {
@@ -1232,6 +1422,55 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && state.entered) pollQuota();
 });
 
+/* ---------------- 语音输入 ---------------- */
+// Web Speech API 只在安全上下文可用：本机 127.0.0.1 / localhost / HTTPS。
+// cpolar 公网是 HTTP（非安全上下文），按钮保留但置灰，点击给原因提示。
+function setupSpeech(btnSel, taSel) {
+  const btn = $(btnSel), ta = $(taSel);
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR || !window.isSecureContext) {
+    btn.disabled = true;
+    btn.title = "语音输入需在本机 127.0.0.1 或 HTTPS 下使用";
+    btn.addEventListener("click", () =>
+      toast("语音输入需在本机 127.0.0.1 或 HTTPS 下使用（公网 HTTP 没有麦克风权限）", true));
+    return;
+  }
+  let rec = null, listening = false, baseText = "";
+  btn.addEventListener("click", () => {
+    if (listening) { try { rec.stop(); } catch { /* noop */ } return; }
+    rec = new SR();
+    rec.lang = "zh-CN";
+    rec.interimResults = true;   // 边说边出字
+    rec.continuous = true;       // 长句不中途断
+    baseText = ta.value;
+    rec.onresult = (e) => {
+      let final = "", interim = "";
+      for (let i = 0; i < e.results.length; i++) {
+        if (e.results[i].isFinal) final += e.results[i][0].transcript;
+        else interim += e.results[i][0].transcript;
+      }
+      const sep = baseText && !/\s$/.test(baseText) ? " " : "";
+      ta.value = baseText + sep + final + interim;
+    };
+    rec.onerror = (e) => {
+      listening = false; btn.classList.remove("rec");
+      if (e.error === "not-allowed") toast("麦克风权限被拒绝，请在浏览器里允许", true);
+      else if (e.error !== "aborted") toast("语音识别失败：" + e.error, true);
+    };
+    rec.onend = () => { listening = false; btn.classList.remove("rec"); };
+    try {
+      rec.start();
+      listening = true; btn.classList.add("rec");
+      ta.focus();
+    } catch {
+      listening = false; btn.classList.remove("rec");
+      toast("语音识别启动失败", true);
+    }
+  });
+}
+setupSpeech("#btn-ext-mic", "#input-text");
+setupSpeech("#btn-mgr-mic", "#mgr-input");
+
 /* ---------------- 其他 ---------------- */
 $("#btn-refresh").addEventListener("click", pollSessions);
 let toastTimer = null;
@@ -1258,7 +1497,8 @@ async function enterApp() {
   await pollSessions();
   setInterval(pollSessions, 5000);
   setInterval(() => {
-    if (state.sel && state.sel.kind === "ext") pollTranscript();
+    if (state.sel && state.sel.kind === "ext") { pollTranscript(); pollOutbox(); }
+    else if (state.sel && state.sel.kind === "mgr") pollOutbox();
     else if (state.sel && state.sel.kind === "hist") pollHistTranscript();
   }, 2500);
   pollHistory();
